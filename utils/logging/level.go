@@ -1,30 +1,29 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package logging
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+
+	"go.uber.org/zap/zapcore"
 )
 
-const alignedStringLen = 5
-
-type Level int
+type Level zapcore.Level
 
 const (
-	Off Level = iota
-	Fatal
-	Error
-	Warn
-	Info
-	Trace
+	Verbo Level = iota - 9
 	Debug
-	Verbo
-)
+	Trace
+	Info
+	Warn
+	Error
+	Fatal
+	Off
 
-const (
 	fatalStr   = "FATAL"
 	errorStr   = "ERROR"
 	warnStr    = "WARN"
@@ -34,7 +33,19 @@ const (
 	verboStr   = "VERBO"
 	offStr     = "OFF"
 	unknownStr = "UNKNO"
+
+	fatalLowStr   = "fatal"
+	errorLowStr   = "error"
+	warnLowStr    = "warn"
+	infoLowStr    = "info"
+	traceLowStr   = "trace"
+	debugLowStr   = "debug"
+	verboLowStr   = "verbo"
+	offLowStr     = "off"
+	unknownLowStr = "unkno"
 )
+
+var ErrUnknownLevel = errors.New("unknown log level")
 
 // Inverse of Level.String()
 func ToLevel(l string) (Level, error) {
@@ -56,35 +67,14 @@ func ToLevel(l string) (Level, error) {
 	case verboStr:
 		return Verbo, nil
 	default:
-		return Off, fmt.Errorf("unknown log level: %q", l)
-	}
-}
-
-func (l Level) Color() Color {
-	switch l {
-	case Fatal:
-		return Red
-	case Error:
-		return Orange
-	case Warn:
-		return Yellow
-	case Info:
-		// Rather than using white, use the default to better support terminals
-		// with a white background.
-		return Reset
-	case Trace:
-		return LightPurple
-	case Debug:
-		return LightBlue
-	case Verbo:
-		return LightGreen
-	default:
-		return Reset
+		return Off, fmt.Errorf("%w: %q", ErrUnknownLevel, l)
 	}
 }
 
 func (l Level) String() string {
 	switch l {
+	case Off:
+		return offStr
 	case Fatal:
 		return fatalStr
 	case Error:
@@ -99,28 +89,33 @@ func (l Level) String() string {
 		return debugStr
 	case Verbo:
 		return verboStr
-	case Off:
-		return offStr
 	default:
 		// This should never happen
 		return unknownStr
 	}
 }
 
-// String representation of this level as it will appear
-// in log files and in logs displayed to screen.
-// The returned value has length [alignedStringLen].
-func (l Level) AlignedString() string {
-	s := l.String()
-	sLen := len(s)
-	switch {
-	case sLen < alignedStringLen:
-		// Pad with spaces on the right
-		return fmt.Sprintf("%s%s", s, strings.Repeat(" ", alignedStringLen-sLen))
-	case sLen == alignedStringLen:
-		return s
+func (l Level) LowerString() string {
+	switch l {
+	case Off:
+		return offLowStr
+	case Fatal:
+		return fatalLowStr
+	case Error:
+		return errorLowStr
+	case Warn:
+		return warnLowStr
+	case Info:
+		return infoLowStr
+	case Trace:
+		return traceLowStr
+	case Debug:
+		return debugLowStr
+	case Verbo:
+		return verboLowStr
 	default:
-		return s[:alignedStringLen]
+		// This should never happen
+		return unknownLowStr
 	}
 }
 

@@ -1,140 +1,170 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package handler
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
-	"github.com/ava-labs/avalanchego/snow/networking/tracker"
+	"github.com/ava-labs/avalanchego/proto/pb/p2p"
+	"github.com/ava-labs/avalanchego/snow/networking/tracker/trackermock"
 	"github.com/ava-labs/avalanchego/snow/validators"
+	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/logging"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 )
 
 func TestQueue(t *testing.T) {
-	assert := assert.New(t)
-	cpuTracker := &tracker.MockTimeTracker{}
-	vdrs := validators.NewSet()
-	vdr1ID, vdr2ID := ids.GenerateTestShortID(), ids.GenerateTestShortID()
-	assert.NoError(vdrs.AddWeight(vdr1ID, 1))
-	assert.NoError(vdrs.AddWeight(vdr2ID, 1))
-	mIntf, err := NewMessageQueue(logging.NoLog{}, vdrs, cpuTracker, "", prometheus.NewRegistry(), message.SynchronousOps)
-	assert.NoError(err)
+	ctrl := gomock.NewController(t)
+	require := require.New(t)
+	cpuTracker := trackermock.NewTracker(ctrl)
+	vdrs := validators.NewManager()
+	vdr1ID, vdr2ID := ids.GenerateTestNodeID(), ids.GenerateTestNodeID()
+	require.NoError(vdrs.AddStaker(constants.PrimaryNetworkID, vdr1ID, nil, ids.Empty, 1))
+	require.NoError(vdrs.AddStaker(constants.PrimaryNetworkID, vdr2ID, nil, ids.Empty, 1))
+	mIntf, err := NewMessageQueue(
+		logging.NoLog{},
+		constants.PrimaryNetworkID,
+		vdrs,
+		cpuTracker,
+		"",
+		prometheus.NewRegistry(),
+	)
+	require.NoError(err)
 	u := mIntf.(*messageQueue)
 	currentTime := time.Now()
 	u.clock.Set(currentTime)
 
-	mc, err := message.NewCreator(prometheus.NewRegistry(), true, "dummyNamespace", 10*time.Second)
-	assert.NoError(err)
-	mc.SetTime(currentTime)
-	msg1 := mc.InboundPut(ids.Empty,
-		0,
-		ids.GenerateTestID(),
-		nil,
-		vdr1ID,
-	)
+	msg1 := Message{
+		InboundMessage: message.InboundPullQuery(
+			ids.Empty,
+			0,
+			time.Second,
+			ids.GenerateTestID(),
+			0,
+			vdr1ID,
+		),
+		EngineType: p2p.EngineType_ENGINE_TYPE_UNSPECIFIED,
+	}
 
-	// Push then pop should work regardless of utilization when there are
-	// no other messages on [u.msgs]
-	cpuTracker.On("Utilization", vdr1ID, mock.Anything).Return(0.1).Once()
-	u.Push(msg1)
-	assert.EqualValues(1, u.nodeToUnprocessedMsgs[vdr1ID])
-	assert.EqualValues(1, u.Len())
-	gotMsg1, ok := u.Pop()
-	assert.True(ok)
-	assert.Len(u.nodeToUnprocessedMsgs, 0)
-	assert.EqualValues(0, u.Len())
-	assert.EqualValues(msg1, gotMsg1)
+	// Push then pop should work regardless of usage when there are no other
+	// messages on [u.msgs]
+	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(0.1).Times(1)
+	u.Push(context.Background(), msg1)
+	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
+	require.Equal(1, u.Len())
+	_, gotMsg1, ok := u.Pop()
+	require.True(ok)
+	require.Empty(u.nodeToUnprocessedMsgs)
+	require.Zero(u.Len())
+	require.Equal(msg1, gotMsg1)
 
-	cpuTracker.On("Utilization", vdr1ID, mock.Anything).Return(0.0).Once()
-	u.Push(msg1)
-	assert.EqualValues(1, u.nodeToUnprocessedMsgs[vdr1ID])
-	assert.EqualValues(1, u.Len())
-	gotMsg1, ok = u.Pop()
-	assert.True(ok)
-	assert.Len(u.nodeToUnprocessedMsgs, 0)
-	assert.EqualValues(0, u.Len())
-	assert.EqualValues(msg1, gotMsg1)
+	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(0.0).Times(1)
+	u.Push(context.Background(), msg1)
+	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
+	require.Equal(1, u.Len())
+	_, gotMsg1, ok = u.Pop()
+	require.True(ok)
+	require.Empty(u.nodeToUnprocessedMsgs)
+	require.Zero(u.Len())
+	require.Equal(msg1, gotMsg1)
 
-	cpuTracker.On("Utilization", vdr1ID, mock.Anything).Return(1.0).Once()
-	u.Push(msg1)
-	assert.EqualValues(1, u.nodeToUnprocessedMsgs[vdr1ID])
-	assert.EqualValues(1, u.Len())
-	gotMsg1, ok = u.Pop()
-	assert.True(ok)
-	assert.Len(u.nodeToUnprocessedMsgs, 0)
-	assert.EqualValues(0, u.Len())
-	assert.EqualValues(msg1, gotMsg1)
+	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(1.0).Times(1)
+	u.Push(context.Background(), msg1)
+	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
+	require.Equal(1, u.Len())
+	_, gotMsg1, ok = u.Pop()
+	require.True(ok)
+	require.Empty(u.nodeToUnprocessedMsgs)
+	require.Zero(u.Len())
+	require.Equal(msg1, gotMsg1)
 
-	cpuTracker.On("Utilization", vdr1ID, mock.Anything).Return(0.0).Once()
-	u.Push(msg1)
-	assert.EqualValues(1, u.nodeToUnprocessedMsgs[vdr1ID])
-	assert.EqualValues(1, u.Len())
-	gotMsg1, ok = u.Pop()
-	assert.True(ok)
-	assert.Len(u.nodeToUnprocessedMsgs, 0)
-	assert.EqualValues(0, u.Len())
-	assert.EqualValues(msg1, gotMsg1)
+	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(0.0).Times(1)
+	u.Push(context.Background(), msg1)
+	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
+	require.Equal(1, u.Len())
+	_, gotMsg1, ok = u.Pop()
+	require.True(ok)
+	require.Empty(u.nodeToUnprocessedMsgs)
+	require.Zero(u.Len())
+	require.Equal(msg1, gotMsg1)
 
 	// Push msg1 from vdr1ID
-	u.Push(msg1)
-	assert.EqualValues(1, u.nodeToUnprocessedMsgs[vdr1ID])
-	assert.EqualValues(1, u.Len())
+	u.Push(context.Background(), msg1)
+	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
+	require.Equal(1, u.Len())
 
-	msg2 := mc.InboundGet(ids.Empty, 0, 0, ids.Empty, vdr2ID)
+	msg2 := Message{
+		InboundMessage: message.InboundPullQuery(
+			ids.Empty,
+			0,
+			time.Second,
+			ids.GenerateTestID(),
+			0,
+			vdr2ID,
+		),
+		EngineType: p2p.EngineType_ENGINE_TYPE_UNSPECIFIED,
+	}
 
 	// Push msg2 from vdr2ID
-	u.Push(msg2)
-	assert.EqualValues(2, u.Len())
-	assert.EqualValues(1, u.nodeToUnprocessedMsgs[vdr2ID])
-	// Set vdr1's CPU utilization to 99% and vdr2's to .01
-	cpuTracker.On("Utilization", vdr1ID, mock.Anything).Return(.99).Twice()
-	cpuTracker.On("Utilization", vdr2ID, mock.Anything).Return(.01).Once()
+	u.Push(context.Background(), msg2)
+	require.Equal(2, u.Len())
+	require.Equal(1, u.nodeToUnprocessedMsgs[vdr2ID])
+	// Set vdr1's usage to 99% and vdr2's to .01
+	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(.99).Times(2)
+	cpuTracker.EXPECT().Usage(vdr2ID, gomock.Any()).Return(.01).Times(1)
 	// Pop should return msg2 first because vdr1 has exceeded it's portion of CPU time
-	gotMsg2, ok := u.Pop()
-	assert.True(ok)
-	assert.EqualValues(1, u.Len())
-	assert.EqualValues(msg2, gotMsg2)
-	gotMsg1, ok = u.Pop()
-	assert.True(ok)
-	assert.EqualValues(msg1, gotMsg1)
-	assert.Len(u.nodeToUnprocessedMsgs, 0)
-	assert.EqualValues(0, u.Len())
+	_, gotMsg2, ok := u.Pop()
+	require.True(ok)
+	require.Equal(1, u.Len())
+	require.Equal(msg2, gotMsg2)
+	_, gotMsg1, ok = u.Pop()
+	require.True(ok)
+	require.Equal(msg1, gotMsg1)
+	require.Empty(u.nodeToUnprocessedMsgs)
+	require.Zero(u.Len())
 
 	// u is now empty
 	// Non-validators should be able to put messages onto [u]
-	nonVdrNodeID1, nonVdrNodeID2 := ids.GenerateTestShortID(), ids.GenerateTestShortID()
-	msg3 := mc.InboundPullQuery(ids.Empty, 0, 0, ids.Empty, nonVdrNodeID1)
-	msg4 := mc.InboundPushQuery(ids.Empty, 0, 0, ids.Empty, nil, nonVdrNodeID2)
-	u.Push(msg3)
-	u.Push(msg4)
-	u.Push(msg1)
-	assert.EqualValues(3, u.Len())
+	nonVdrNodeID1, nonVdrNodeID2 := ids.GenerateTestNodeID(), ids.GenerateTestNodeID()
+	msg3 := Message{
+		InboundMessage: message.InboundPullQuery(ids.Empty, 0, 0, ids.Empty, 0, nonVdrNodeID1),
+		EngineType:     p2p.EngineType_ENGINE_TYPE_UNSPECIFIED,
+	}
+	msg4 := Message{
+		InboundMessage: message.InboundPushQuery(ids.Empty, 0, 0, nil, 0, nonVdrNodeID2),
+		EngineType:     p2p.EngineType_ENGINE_TYPE_UNSPECIFIED,
+	}
+	u.Push(context.Background(), msg3)
+	u.Push(context.Background(), msg4)
+	u.Push(context.Background(), msg1)
+	require.Equal(3, u.Len())
 
 	// msg1 should get popped first because nonVdrNodeID1 and nonVdrNodeID2
 	// exceeded their limit
-	cpuTracker.On("Utilization", nonVdrNodeID1, mock.Anything).Return(.34).Once()
-	cpuTracker.On("Utilization", nonVdrNodeID2, mock.Anything).Return(.34).Times(3)
-	cpuTracker.On("Utilization", vdr1ID, mock.Anything).Return(0.0).Once()
+	cpuTracker.EXPECT().Usage(nonVdrNodeID1, gomock.Any()).Return(.34).Times(1)
+	cpuTracker.EXPECT().Usage(nonVdrNodeID2, gomock.Any()).Return(.34).Times(2)
+	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(0.0).Times(1)
 
 	// u.msgs is [msg3, msg4, msg1]
-	gotMsg1, ok = u.Pop()
-	assert.True(ok)
-	assert.EqualValues(msg1, gotMsg1)
+	_, gotMsg1, ok = u.Pop()
+	require.True(ok)
+	require.Equal(msg1, gotMsg1)
 	// u.msgs is [msg3, msg4]
-	cpuTracker.On("Utilization", nonVdrNodeID1, mock.Anything).Return(.51).Twice()
-	gotMsg4, ok := u.Pop()
-	assert.True(ok)
-	assert.EqualValues(msg4, gotMsg4)
+	cpuTracker.EXPECT().Usage(nonVdrNodeID1, gomock.Any()).Return(.51).Times(2)
+	_, gotMsg4, ok := u.Pop()
+	require.True(ok)
+	require.Equal(msg4, gotMsg4)
 	// u.msgs is [msg3]
-	gotMsg3, ok := u.Pop()
-	assert.True(ok)
-	assert.EqualValues(msg3, gotMsg3)
-	assert.EqualValues(0, u.Len())
+	_, gotMsg3, ok := u.Pop()
+	require.True(ok)
+	require.Equal(msg3, gotMsg3)
+	require.Zero(u.Len())
 }

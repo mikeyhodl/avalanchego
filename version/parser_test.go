@@ -1,79 +1,66 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package version
 
 import (
+	"strconv"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestNewDefaultVersionParser(t *testing.T) {
-	p := NewDefaultParser()
+func TestParse(t *testing.T) {
+	v, err := Parse("v1.2.3")
 
-	v, err := p.Parse("v1.2.3")
+	require.NoError(t, err)
+	require.NotNil(t, v)
+	require.Equal(t, "v1.2.3", v.String())
+	require.Equal(t, 1, v.Major)
+	require.Equal(t, 2, v.Minor)
+	require.Equal(t, 3, v.Patch)
 
-	assert.NoError(t, err)
-	assert.NotNil(t, v)
-	assert.Equal(t, "v1.2.3", v.String())
-	assert.Equal(t, 1, v.Major())
-	assert.Equal(t, 2, v.Minor())
-	assert.Equal(t, 3, v.Patch())
-
-	badVersions := []string{
-		"",
-		"1.2.3",
-		"vz.2.3",
-		"v1.z.3",
-		"v1.2.z",
+	tests := []struct {
+		version     string
+		expectedErr error
+	}{
+		{
+			version:     "",
+			expectedErr: errMissingVersionPrefix,
+		},
+		{
+			version:     "1.2.3",
+			expectedErr: errMissingVersionPrefix,
+		},
+		{
+			version:     "z1.2.3",
+			expectedErr: errMissingVersionPrefix,
+		},
+		{
+			version:     "v1.2",
+			expectedErr: errMissingVersions,
+		},
+		{
+			version:     "vz.2.3",
+			expectedErr: strconv.ErrSyntax,
+		},
+		{
+			version:     "v1.z.3",
+			expectedErr: strconv.ErrSyntax,
+		},
+		{
+			version:     "v1.2.z",
+			expectedErr: strconv.ErrSyntax,
+		},
+		{
+			version:     "v1.2.3.4",
+			expectedErr: strconv.ErrSyntax,
+		},
 	}
-	for _, badVersion := range badVersions {
-		_, err := p.Parse(badVersion)
-		assert.Error(t, err)
+	for _, test := range tests {
+		t.Run(test.version, func(t *testing.T) {
+			_, err := Parse(test.version)
+			require.ErrorIs(t, err, test.expectedErr)
+		})
 	}
-}
-
-func TestNewDefaultApplicationParser(t *testing.T) {
-	p := NewDefaultApplicationParser()
-
-	v, err := p.Parse("avalanche/1.2.3")
-
-	assert.NoError(t, err)
-	assert.NotNil(t, v)
-	assert.Equal(t, "avalanche/1.2.3", v.String())
-	assert.Equal(t, "avalanche", v.App())
-	assert.Equal(t, 1, v.Major())
-	assert.Equal(t, 2, v.Minor())
-	assert.Equal(t, 3, v.Patch())
-	assert.NoError(t, v.Compatible(v))
-	assert.False(t, v.Before(v))
-
-	badVersions := []string{
-		"",
-		"avalanche/",
-		"avalanche/z.0.0",
-		"avalanche/0.z.0",
-		"avalanche/0.0.z",
-	}
-	for _, badVersion := range badVersions {
-		_, err := p.Parse(badVersion)
-		assert.Error(t, err)
-	}
-}
-
-func TestNewApplicationParser(t *testing.T) {
-	p := NewApplicationParser(":", ",")
-
-	v, err := p.Parse("avalanche:1,2,3")
-
-	assert.NoError(t, err)
-	assert.NotNil(t, v)
-	assert.Equal(t, "avalanche:1,2,3", v.String())
-	assert.Equal(t, "avalanche", v.App())
-	assert.Equal(t, 1, v.Major())
-	assert.Equal(t, 2, v.Minor())
-	assert.Equal(t, 3, v.Patch())
-	assert.NoError(t, v.Compatible(v))
-	assert.False(t, v.Before(v))
 }

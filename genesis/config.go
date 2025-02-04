@@ -1,22 +1,33 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package genesis
 
 import (
+	"cmp"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/utils"
 	"github.com/ava-labs/avalanchego/utils/constants"
-	"github.com/ava-labs/avalanchego/utils/formatting"
-	"github.com/ava-labs/avalanchego/utils/wrappers"
+	"github.com/ava-labs/avalanchego/utils/formatting/address"
+	"github.com/ava-labs/avalanchego/utils/math"
+	"github.com/ava-labs/avalanchego/vms/platformvm/signer"
+)
 
-	safemath "github.com/ava-labs/avalanchego/utils/math"
+const localNetworkUpdateStartTimePeriod = 9 * 30 * 24 * time.Hour // 9 months
+
+var (
+	_ utils.Sortable[Allocation] = Allocation{}
+
+	errInvalidGenesisJSON = errors.New("could not unmarshal genesis JSON")
 )
 
 type LockedAmount struct {
@@ -37,7 +48,7 @@ func (a Allocation) Unparse(networkID uint32) (UnparsedAllocation, error) {
 		UnlockSchedule: a.UnlockSchedule,
 		ETHAddr:        "0x" + hex.EncodeToString(a.ETHAddr.Bytes()),
 	}
-	avaxAddr, err := formatting.FormatAddress(
+	avaxAddr, err := address.Format(
 		"X",
 		constants.GetHRP(networkID),
 		a.AVAXAddr.Bytes(),
@@ -46,22 +57,31 @@ func (a Allocation) Unparse(networkID uint32) (UnparsedAllocation, error) {
 	return ua, err
 }
 
+func (a Allocation) Compare(other Allocation) int {
+	if amountCmp := cmp.Compare(a.InitialAmount, other.InitialAmount); amountCmp != 0 {
+		return amountCmp
+	}
+	return a.AVAXAddr.Compare(other.AVAXAddr)
+}
+
 type Staker struct {
-	NodeID        ids.ShortID `json:"nodeID"`
-	RewardAddress ids.ShortID `json:"rewardAddress"`
-	DelegationFee uint32      `json:"delegationFee"`
+	NodeID        ids.NodeID                `json:"nodeID"`
+	RewardAddress ids.ShortID               `json:"rewardAddress"`
+	DelegationFee uint32                    `json:"delegationFee"`
+	Signer        *signer.ProofOfPossession `json:"signer,omitempty"`
 }
 
 func (s Staker) Unparse(networkID uint32) (UnparsedStaker, error) {
-	avaxAddr, err := formatting.FormatAddress(
+	avaxAddr, err := address.Format(
 		"X",
 		constants.GetHRP(networkID),
 		s.RewardAddress.Bytes(),
 	)
 	return UnparsedStaker{
-		NodeID:        s.NodeID.PrefixedString(constants.NodeIDPrefix),
+		NodeID:        s.NodeID,
 		RewardAddress: avaxAddr,
 		DelegationFee: s.DelegationFee,
+		Signer:        s.Signer,
 	}, err
 }
 
@@ -102,7 +122,7 @@ func (c Config) Unparse() (UnparsedConfig, error) {
 		uc.Allocations[i] = ua
 	}
 	for i, isa := range c.InitialStakedFunds {
-		avaxAddr, err := formatting.FormatAddress(
+		avaxAddr, err := address.Format(
 			"X",
 			constants.GetHRP(uc.NetworkID),
 			isa.Bytes(),
@@ -126,12 +146,12 @@ func (c Config) Unparse() (UnparsedConfig, error) {
 func (c *Config) InitialSupply() (uint64, error) {
 	initialSupply := uint64(0)
 	for _, allocation := range c.Allocations {
-		newInitialSupply, err := safemath.Add64(initialSupply, allocation.InitialAmount)
+		newInitialSupply, err := math.Add(initialSupply, allocation.InitialAmount)
 		if err != nil {
 			return 0, err
 		}
 		for _, unlock := range allocation.UnlockSchedule {
-			newInitialSupply, err = safemath.Add64(newInitialSupply, unlock.Amount)
+			newInitialSupply, err = math.Add(newInitialSupply, unlock.Amount)
 			if err != nil {
 				return 0, err
 			}
@@ -153,6 +173,10 @@ var (
 	// LocalConfig is the config that should be used to generate a local
 	// genesis.
 	LocalConfig Config
+
+	// unmodifiedLocalConfig is the LocalConfig before advancing the StartTime
+	// to a recent value.
+	unmodifiedLocalConfig Config
 )
 
 func init() {
@@ -160,31 +184,40 @@ func init() {
 	unparsedFujiConfig := UnparsedConfig{}
 	unparsedLocalConfig := UnparsedConfig{}
 
-	errs := wrappers.Errs{}
-	errs.Add(
-		json.Unmarshal([]byte(mainnetGenesisConfigJSON), &unparsedMainnetConfig),
-		json.Unmarshal([]byte(fujiGenesisConfigJSON), &unparsedFujiConfig),
-		json.Unmarshal([]byte(localGenesisConfigJSON), &unparsedLocalConfig),
+	err := errors.Join(
+		json.Unmarshal(mainnetGenesisConfigJSON, &unparsedMainnetConfig),
+		json.Unmarshal(fujiGenesisConfigJSON, &unparsedFujiConfig),
+		json.Unmarshal(localGenesisConfigJSON, &unparsedLocalConfig),
 	)
-	if errs.Errored() {
-		panic(errs.Err)
+	if err != nil {
+		panic(err)
 	}
 
-	mainnetConfig, err := unparsedMainnetConfig.Parse()
-	errs.Add(err)
-	MainnetConfig = mainnetConfig
-
-	fujiConfig, err := unparsedFujiConfig.Parse()
-	errs.Add(err)
-	FujiConfig = fujiConfig
-
-	localConfig, err := unparsedLocalConfig.Parse()
-	errs.Add(err)
-	LocalConfig = localConfig
-
-	if errs.Errored() {
-		panic(errs.Err)
+	MainnetConfig, err = unparsedMainnetConfig.Parse()
+	if err != nil {
+		panic(err)
 	}
+
+	FujiConfig, err = unparsedFujiConfig.Parse()
+	if err != nil {
+		panic(err)
+	}
+
+	unmodifiedLocalConfig, err = unparsedLocalConfig.Parse()
+	if err != nil {
+		panic(err)
+	}
+
+	// Renew the staking start time of the local config if required
+	definedStartTime := time.Unix(int64(unmodifiedLocalConfig.StartTime), 0)
+	recentStartTime := getRecentStartTime(
+		definedStartTime,
+		time.Now(),
+		localNetworkUpdateStartTimePeriod,
+	)
+
+	LocalConfig = unmodifiedLocalConfig
+	LocalConfig.StartTime = uint64(recentStartTime.Unix())
 }
 
 func GetConfig(networkID uint32) *Config {
@@ -223,7 +256,7 @@ func GetConfigContent(genesisContent string) (*Config, error) {
 func parseGenesisJSONBytesToConfig(bytes []byte) (*Config, error) {
 	var unparsedConfig UnparsedConfig
 	if err := json.Unmarshal(bytes, &unparsedConfig); err != nil {
-		return nil, fmt.Errorf("could not unmarshal JSON: %w", err)
+		return nil, fmt.Errorf("%w: %w", errInvalidGenesisJSON, err)
 	}
 
 	config, err := unparsedConfig.Parse()
@@ -231,4 +264,22 @@ func parseGenesisJSONBytesToConfig(bytes []byte) (*Config, error) {
 		return nil, fmt.Errorf("unable to parse config: %w", err)
 	}
 	return &config, nil
+}
+
+// getRecentStartTime advances [definedStartTime] in chunks of [period]. It
+// returns the latest startTime that isn't after [now].
+func getRecentStartTime(
+	definedStartTime time.Time,
+	now time.Time,
+	period time.Duration,
+) time.Time {
+	startTime := definedStartTime
+	for {
+		nextStartTime := startTime.Add(period)
+		if now.Before(nextStartTime) {
+			break
+		}
+		startTime = nextStartTime
+	}
+	return startTime
 }

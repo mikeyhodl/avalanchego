@@ -1,28 +1,22 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package network
 
 import (
-	"errors"
 	"net"
-
-	"github.com/ava-labs/avalanchego/utils"
+	"net/netip"
 )
 
-var (
-	errClosed = errors.New("closed")
-
-	_ net.Listener = &testListener{}
-)
+var _ net.Listener = (*testListener)(nil)
 
 type testListener struct {
-	ip      utils.IPDesc
+	ip      netip.AddrPort
 	inbound chan net.Conn
 	closed  chan struct{}
 }
 
-func newTestListener(ip utils.IPDesc) *testListener {
+func newTestListener(ip netip.AddrPort) *testListener {
 	return &testListener{
 		ip:      ip,
 		inbound: make(chan net.Conn),
@@ -46,7 +40,7 @@ func (l *testListener) Close() error {
 
 func (l *testListener) Addr() net.Addr {
 	return &net.TCPAddr{
-		IP:   l.ip.IP,
-		Port: int(l.ip.Port),
+		IP:   l.ip.Addr().AsSlice(),
+		Port: int(l.ip.Port()),
 	}
 }

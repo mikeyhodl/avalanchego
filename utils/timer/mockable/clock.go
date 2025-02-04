@@ -1,11 +1,9 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package mockable
 
-import (
-	"time"
-)
+import "time"
 
 // MaxTime was taken from https://stackoverflow.com/questions/25065055/what-is-the-maximum-time-time-in-go/32620397#32620397
 var MaxTime = time.Unix(1<<63-62135596801, 0) // 0 is used because we drop the nano-seconds
@@ -30,7 +28,13 @@ func (c *Clock) Time() time.Time {
 	return time.Now()
 }
 
-// Unix returns the unix time on this clock.
+// Time returns the unix time on this clock
+func (c *Clock) UnixTime() time.Time {
+	resTime := c.Time()
+	return resTime.Truncate(time.Second)
+}
+
+// Unix returns the unix timestamp on this clock.
 func (c *Clock) Unix() uint64 {
 	unix := c.Time().Unix()
 	if unix < 0 {

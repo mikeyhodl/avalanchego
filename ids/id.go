@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package ids
@@ -8,27 +8,29 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/ava-labs/avalanchego/utils"
-	"github.com/ava-labs/avalanchego/utils/formatting"
+	"github.com/ava-labs/avalanchego/utils/cb58"
 	"github.com/ava-labs/avalanchego/utils/hashing"
 	"github.com/ava-labs/avalanchego/utils/wrappers"
 )
 
 const (
-	// The encoding used to convert IDs from bytes to string and vice versa
-	defaultEncoding = formatting.CB58
+	IDLen   = 32
+	nullStr = "null"
 )
 
 var (
 	// Empty is a useful all zero value
-	Empty            = ID{}
+	Empty = ID{}
+
 	errMissingQuotes = errors.New("first and last characters should be quotes")
+
+	_ utils.Sortable[ID] = ID{}
 )
 
 // ID wraps a 32 byte hash used as an identifier
-type ID [32]byte
+type ID [IDLen]byte
 
 // ToID attempt to convert a byte slice into an id
 func ToID(bytes []byte) (ID, error) {
@@ -37,24 +39,33 @@ func ToID(bytes []byte) (ID, error) {
 
 // FromString is the inverse of ID.String()
 func FromString(idStr string) (ID, error) {
-	bytes, err := formatting.Decode(defaultEncoding, idStr)
+	bytes, err := cb58.Decode(idStr)
 	if err != nil {
 		return ID{}, err
 	}
 	return ToID(bytes)
 }
 
+// FromStringOrPanic is the same as FromString, but will panic on error
+func FromStringOrPanic(idStr string) ID {
+	id, err := FromString(idStr)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
 func (id ID) MarshalJSON() ([]byte, error) {
-	str, err := formatting.EncodeWithChecksum(defaultEncoding, id[:])
+	str, err := cb58.Encode(id[:])
 	if err != nil {
 		return nil, err
 	}
-	return []byte("\"" + str + "\""), nil
+	return []byte(`"` + str + `"`), nil
 }
 
 func (id *ID) UnmarshalJSON(b []byte) error {
 	str := string(b)
-	if str == "null" { // If "null", do nothing
+	if str == nullStr { // If "null", do nothing
 		return nil
 	} else if len(str) < 2 {
 		return errMissingQuotes
@@ -66,7 +77,7 @@ func (id *ID) UnmarshalJSON(b []byte) error {
 	}
 
 	// Parse CB58 formatted string to bytes
-	bytes, err := formatting.Decode(defaultEncoding, str[1:lastIndex])
+	bytes, err := cb58.Decode(str[1:lastIndex])
 	if err != nil {
 		return fmt.Errorf("couldn't decode ID to bytes: %w", err)
 	}
@@ -85,7 +96,7 @@ func (id *ID) UnmarshalText(text []byte) error {
 // This will return a new id and not modify the original id.
 func (id ID) Prefix(prefixes ...uint64) ID {
 	packer := wrappers.Packer{
-		Bytes: make([]byte, len(prefixes)*wrappers.LongLen+hashing.HashLen),
+		Bytes: make([]byte, len(prefixes)*wrappers.LongLen+IDLen),
 	}
 
 	for _, prefix := range prefixes {
@@ -94,6 +105,35 @@ func (id ID) Prefix(prefixes ...uint64) ID {
 	packer.PackFixedBytes(id[:])
 
 	return hashing.ComputeHash256Array(packer.Bytes)
+}
+
+// Append this id with the provided suffixes and re-hash the result. This
+// returns a new ID and does not modify the original ID.
+//
+// This is used to generate ACP-77 validationIDs.
+//
+// Ref: https://github.com/avalanche-foundation/ACPs/tree/e333b335c34c8692d84259d21bd07b2bb849dc2c/ACPs/77-reinventing-subnets#convertsubnettol1tx
+func (id ID) Append(suffixes ...uint32) ID {
+	packer := wrappers.Packer{
+		Bytes: make([]byte, IDLen+len(suffixes)*wrappers.IntLen),
+	}
+
+	packer.PackFixedBytes(id[:])
+	for _, suffix := range suffixes {
+		packer.PackInt(suffix)
+	}
+
+	return hashing.ComputeHash256Array(packer.Bytes)
+}
+
+// XOR this id and the provided id and return the resulting id.
+//
+// Note: this id is not modified.
+func (id ID) XOR(other ID) ID {
+	for i, b := range other {
+		id[i] ^= b
+	}
+	return id
 }
 
 // Bit returns the bit value at the ith index of the byte array. Returns 0 or 1
@@ -118,12 +158,14 @@ func (id ID) Bit(i uint) int {
 }
 
 // Hex returns a hex encoded string of this id.
-func (id ID) Hex() string { return hex.EncodeToString(id[:]) }
+func (id ID) Hex() string {
+	return hex.EncodeToString(id[:])
+}
 
 func (id ID) String() string {
 	// We assume that the maximum size of a byte slice that
 	// can be stringified is at least the length of an ID
-	s, _ := formatting.EncodeWithChecksum(defaultEncoding, id[:])
+	s, _ := cb58.Encode(id[:])
 	return s
 }
 
@@ -131,18 +173,6 @@ func (id ID) MarshalText() ([]byte, error) {
 	return []byte(id.String()), nil
 }
 
-type sortIDData []ID
-
-func (ids sortIDData) Less(i, j int) bool {
-	return bytes.Compare(
-		ids[i][:],
-		ids[j][:]) == -1
+func (id ID) Compare(other ID) int {
+	return bytes.Compare(id[:], other[:])
 }
-func (ids sortIDData) Len() int      { return len(ids) }
-func (ids sortIDData) Swap(i, j int) { ids[j], ids[i] = ids[i], ids[j] }
-
-// SortIDs sorts the ids lexicographically
-func SortIDs(ids []ID) { sort.Sort(sortIDData(ids)) }
-
-// IsSortedAndUniqueIDs returns true if the ids are sorted and unique
-func IsSortedAndUniqueIDs(ids []ID) bool { return utils.IsSortedAndUnique(sortIDData(ids)) }

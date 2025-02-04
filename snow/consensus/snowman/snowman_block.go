@@ -1,18 +1,16 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package snowman
 
 import (
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/snow/choices"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowball"
 )
 
 // Tracks the state of a snowman block
 type snowmanBlock struct {
-	// pointer to the snowman instance this node is managed by
-	sm Consensus
+	t *Topological
 
 	// block that this node contains. For the genesis, this value will be nil
 	blk Block
@@ -21,7 +19,7 @@ type snowmanBlock struct {
 	// less than Alpha votes
 	shouldFalter bool
 
-	// sb is the snowball instance used to decided which child is the canonical
+	// sb is the snowball instance used to decide which child is the canonical
 	// child of this block. If this node has not had a child issued under it,
 	// this value will be nil
 	sb snowball.Consensus
@@ -38,8 +36,7 @@ func (n *snowmanBlock) AddChild(child Block) {
 	// if the snowball instance is nil, this is the first child. So the instance
 	// should be initialized.
 	if n.sb == nil {
-		n.sb = &snowball.Tree{}
-		n.sb.Initialize(n.sm.Parameters(), childID)
+		n.sb = snowball.NewTree(n.t.Factory, n.t.params, childID)
 		n.children = make(map[ids.ID]Block)
 	} else {
 		n.sb.Add(childID)
@@ -48,11 +45,8 @@ func (n *snowmanBlock) AddChild(child Block) {
 	n.children[childID] = child
 }
 
-func (n *snowmanBlock) Accepted() bool {
+func (n *snowmanBlock) Decided() bool {
 	// if the block is nil, then this is the genesis which is defined as
 	// accepted
-	if n.blk == nil {
-		return true
-	}
-	return n.blk.Status() == choices.Accepted
+	return n.blk == nil || n.blk.Height() <= n.t.lastAcceptedHeight
 }

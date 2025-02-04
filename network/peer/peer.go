@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package peer
@@ -6,41 +6,62 @@ package peer
 import (
 	"bufio"
 	"context"
-	"crypto/x509"
-	"encoding/binary"
 	"errors"
 	"io"
 	"math"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
+	"github.com/ava-labs/avalanchego/proto/pb/p2p"
+	"github.com/ava-labs/avalanchego/staking"
 	"github.com/ava-labs/avalanchego/utils"
+	"github.com/ava-labs/avalanchego/utils/bloom"
 	"github.com/ava-labs/avalanchego/utils/constants"
-	"github.com/ava-labs/avalanchego/utils/formatting"
+	"github.com/ava-labs/avalanchego/utils/crypto/bls"
+	"github.com/ava-labs/avalanchego/utils/ips"
 	"github.com/ava-labs/avalanchego/utils/json"
+	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/utils/wrappers"
 	"github.com/ava-labs/avalanchego/version"
+)
+
+const (
+	// maxBloomSaltLen restricts the allowed size of the bloom salt to prevent
+	// excessively expensive bloom filter contains checks.
+	maxBloomSaltLen = 32
+	// maxNumTrackedSubnets limits how many subnets a peer can track to prevent
+	// excessive memory usage.
+	maxNumTrackedSubnets = 16
+
+	disconnectingLog         = "disconnecting from peer"
+	failedToCreateMessageLog = "failed to create message"
+	failedToSetDeadlineLog   = "failed to set connection deadline"
+	failedToGetUptimeLog     = "failed to get peer uptime percentage"
+	malformedMessageLog      = "malformed message"
 )
 
 var (
 	errClosed = errors.New("closed")
 
-	_ Peer = &peer{}
+	_ Peer = (*peer)(nil)
 )
 
 // Peer encapsulates all of the functionality required to send and receive
 // messages with a remote peer.
 type Peer interface {
 	// ID returns the nodeID of the remote peer.
-	ID() ids.ShortID
+	ID() ids.NodeID
 
 	// Cert returns the certificate that the remote peer is using to
 	// authenticate their messages.
-	Cert() *x509.Certificate
+	Cert() *staking.Certificate
 
 	// LastSent returns the last time a message was sent to the peer.
 	LastSent() time.Time
@@ -67,21 +88,26 @@ type Peer interface {
 
 	// Version returns the claimed node version this peer is running. It should
 	// only be called after [Ready] returns true.
-	Version() version.Application
+	Version() *version.Application
 
 	// TrackedSubnets returns the subnets this peer is running. It should only
 	// be called after [Ready] returns true.
-	TrackedSubnets() ids.Set
+	TrackedSubnets() set.Set[ids.ID]
 
-	// ObservedUptime returns the local node's uptime according to the peer. The
-	// value ranges from [0, 100]. It should only be called after [Ready]
-	// returns true.
-	ObservedUptime() uint8
+	// ObservedUptime returns the local node's primary network uptime according to the
+	// peer. The value ranges from [0, 100]. It should only be called after
+	// [Ready] returns true.
+	ObservedUptime() uint32
 
 	// Send attempts to send [msg] to the peer. The peer takes ownership of
 	// [msg] for reference counting. This returns false if the message is
 	// guaranteed not to be delivered to the peer.
-	Send(msg message.OutboundMessage) bool
+	Send(ctx context.Context, msg message.OutboundMessage) bool
+
+	// StartSendGetPeerList attempts to send a GetPeerList message to this peer
+	// on this peer's gossip routine. It is not guaranteed that a GetPeerList
+	// will be sent.
+	StartSendGetPeerList()
 
 	// StartClose will begin shutting down the peer. It will not block.
 	StartClose()
@@ -104,35 +130,48 @@ type peer struct {
 
 	// [cert] is this peer's certificate, specifically the leaf of the
 	// certificate chain they provided.
-	cert *x509.Certificate
+	cert *staking.Certificate
 
 	// node ID of this peer.
-	id ids.ShortID
+	id ids.NodeID
 
-	// ip is the claimed IP the peer gave us in the Version message.
+	// queue of messages to send to this peer.
+	messageQueue MessageQueue
+
+	// ip is the claimed IP the peer gave us in the Handshake message.
 	ip *SignedIP
 	// version is the claimed version the peer is running that we received in
-	// the Version message.
-	version version.Application
-	// trackedSubnets is the subset of subnetIDs the peer sent us in the Version
-	// message that we are also tracking.
-	trackedSubnets ids.Set
+	// the Handshake message.
+	version *version.Application
+	// trackedSubnets are the subnetIDs the peer sent us in the Handshake
+	// message. The primary network ID is always included.
+	trackedSubnets set.Set[ids.ID]
+	// options of ACPs provided in the Handshake message.
+	supportedACPs set.Set[uint32]
+	objectedACPs  set.Set[uint32]
 
-	observedUptimeLock sync.RWMutex
-	// [observedUptimeLock] must be held while accessing [observedUptime]
-	observedUptime uint8
+	// txIDOfVerifiedBLSKey is the txID that added the BLS key that was most
+	// recently verified to have signed the IP.
+	//
+	// Invariant: Prior to the handshake being completed, this can only be
+	// accessed by the reader goroutine. After the handshake has been completed,
+	// this can only be accessed by the message sender goroutine.
+	txIDOfVerifiedBLSKey ids.ID
 
-	// True if this peer has sent us a valid Version message and
+	// Our primary network uptime perceived by the peer
+	observedUptime utils.Atomic[uint32]
+
+	// True if this peer has sent us a valid Handshake message and
 	// is running a compatible version.
 	// Only modified on the connection's reader routine.
-	gotVersion utils.AtomicBool
+	gotHandshake utils.Atomic[bool]
 
 	// True if the peer:
-	// * Has sent us a Version message
+	// * Has sent us a Handshake message
 	// * Has sent us a PeerList message
 	// * Is running a compatible version
 	// Only modified on the connection's reader routine.
-	finishedHandshake utils.AtomicBool
+	finishedHandshake utils.Atomic[bool]
 
 	// onFinishHandshake is closed when the peer finishes the p2p handshake.
 	onFinishHandshake chan struct{}
@@ -140,69 +179,63 @@ type peer struct {
 	// numExecuting is the number of goroutines this peer is currently using
 	numExecuting     int64
 	startClosingOnce sync.Once
-	// onClosing is closed when the peer starts closing
-	onClosing chan struct{}
+	// onClosingCtx is canceled when the peer starts closing
+	onClosingCtx context.Context
+	// onClosingCtxCancel cancels onClosingCtx
+	onClosingCtxCancel func()
 
 	// onClosed is closed when the peer is closed
 	onClosed chan struct{}
 
-	// Signalled when a message is added to [sendQueue], and when [p.closing] is
-	// set to true. [sendQueueCond.L] must be held when using [sendQueue] and
-	// [canSend].
-	sendQueueCond *sync.Cond
-
-	// closing flags whether the peer has started shutting down.
-	closing bool
-
-	// canSend flags whether the send queue has been closed. This is separate
-	// from [closing] because it's possible for the send queue to be flushed
-	// before [StartClose] is called.
-	canSend bool
-
-	// queue of the messages to be sent to this peer
-	sendQueue []message.OutboundMessage
-
 	// Unix time of the last message sent and received respectively
 	// Must only be accessed atomically
 	lastSent, lastReceived int64
+
+	// getPeerListChan signals that we should attempt to send a GetPeerList to
+	// this peer
+	getPeerListChan chan struct{}
 }
 
+// Start a new peer instance.
+//
+// Invariant: There must only be one peer running at a time with a reference to
+// the same [config.InboundMsgThrottler].
 func Start(
 	config *Config,
 	conn net.Conn,
-	cert *x509.Certificate,
-	id ids.ShortID,
+	cert *staking.Certificate,
+	id ids.NodeID,
+	messageQueue MessageQueue,
 ) Peer {
+	onClosingCtx, onClosingCtxCancel := context.WithCancel(context.Background())
 	p := &peer{
-		Config:            config,
-		conn:              conn,
-		cert:              cert,
-		id:                id,
-		onFinishHandshake: make(chan struct{}),
-		numExecuting:      3,
-		onClosing:         make(chan struct{}),
-		onClosed:          make(chan struct{}),
-		sendQueueCond:     sync.NewCond(&sync.Mutex{}),
-		canSend:           true,
+		Config:             config,
+		conn:               conn,
+		cert:               cert,
+		id:                 id,
+		messageQueue:       messageQueue,
+		onFinishHandshake:  make(chan struct{}),
+		numExecuting:       3,
+		onClosingCtx:       onClosingCtx,
+		onClosingCtxCancel: onClosingCtxCancel,
+		onClosed:           make(chan struct{}),
+		getPeerListChan:    make(chan struct{}, 1),
 	}
-
-	p.trackedSubnets.Add(constants.PrimaryNetworkID)
-
-	// Make sure that the version is the first message sent
-	msg, err := p.Network.Version()
-	p.Log.AssertNoError(err)
-	p.Send(msg)
 
 	go p.readMessages()
 	go p.writeMessages()
-	go p.sendPings()
+	go p.sendNetworkMessages()
 
 	return p
 }
 
-func (p *peer) ID() ids.ShortID { return p.id }
+func (p *peer) ID() ids.NodeID {
+	return p.id
+}
 
-func (p *peer) Cert() *x509.Certificate { return p.cert }
+func (p *peer) Cert() *staking.Certificate {
+	return p.cert
+}
 
 func (p *peer) LastSent() time.Time {
 	return time.Unix(
@@ -218,7 +251,9 @@ func (p *peer) LastReceived() time.Time {
 	)
 }
 
-func (p *peer) Ready() bool { return p.finishedHandshake.GetValue() }
+func (p *peer) Ready() bool {
+	return p.finishedHandshake.Get()
+}
 
 func (p *peer) AwaitReady(ctx context.Context) error {
 	select {
@@ -232,89 +267,61 @@ func (p *peer) AwaitReady(ctx context.Context) error {
 }
 
 func (p *peer) Info() Info {
-	publicIPStr := ""
-	if !p.ip.IP.IP.IsZero() {
-		publicIPStr = p.ip.IP.IP.String()
-	}
+	primaryUptime := p.ObservedUptime()
+
+	ip, _ := ips.ParseAddrPort(p.conn.RemoteAddr().String())
 	return Info{
-		IP:             p.conn.RemoteAddr().String(),
-		PublicIP:       publicIPStr,
-		ID:             p.id.PrefixedString(constants.NodeIDPrefix),
+		IP:             ip,
+		PublicIP:       p.ip.AddrPort,
+		ID:             p.id,
 		Version:        p.version.String(),
-		LastSent:       time.Unix(atomic.LoadInt64(&p.lastSent), 0),
-		LastReceived:   time.Unix(atomic.LoadInt64(&p.lastReceived), 0),
-		ObservedUptime: json.Uint8(p.ObservedUptime()),
-		TrackedSubnets: p.trackedSubnets.List(),
+		LastSent:       p.LastSent(),
+		LastReceived:   p.LastReceived(),
+		ObservedUptime: json.Uint32(primaryUptime),
+		TrackedSubnets: p.trackedSubnets,
+		SupportedACPs:  p.supportedACPs,
+		ObjectedACPs:   p.objectedACPs,
 	}
 }
 
-func (p *peer) IP() *SignedIP { return p.ip }
-
-func (p *peer) Version() version.Application { return p.version }
-
-func (p *peer) TrackedSubnets() ids.Set { return p.trackedSubnets }
-
-func (p *peer) ObservedUptime() uint8 {
-	p.observedUptimeLock.RLock()
-	uptime := p.observedUptime
-	p.observedUptimeLock.RUnlock()
-	return uptime
+func (p *peer) IP() *SignedIP {
+	return p.ip
 }
 
-func (p *peer) Send(msg message.OutboundMessage) bool {
-	// Acquire space on the outbound message queue, or drop [msg] if we can't.
-	if !p.OutboundMsgThrottler.Acquire(msg, p.id) {
-		p.Log.Debug(
-			"dropping %s message to %s%s due to rate-limiting",
-			msg.Op(),
-			constants.NodeIDPrefix, p.id,
-		)
-		p.Metrics.SendFailed(msg)
-		return false
+func (p *peer) Version() *version.Application {
+	return p.version
+}
+
+func (p *peer) TrackedSubnets() set.Set[ids.ID] {
+	return p.trackedSubnets
+}
+
+func (p *peer) ObservedUptime() uint32 {
+	return p.observedUptime.Get()
+}
+
+func (p *peer) Send(ctx context.Context, msg message.OutboundMessage) bool {
+	return p.messageQueue.Push(ctx, msg)
+}
+
+func (p *peer) StartSendGetPeerList() {
+	select {
+	case p.getPeerListChan <- struct{}{}:
+	default:
 	}
-
-	// Invariant: must call p.outboundMsgThrottler.Release(msg, p.id) when done
-	// sending [msg] or when we give up sending [msg].
-
-	p.sendQueueCond.L.Lock()
-	defer p.sendQueueCond.L.Unlock()
-
-	if !p.canSend {
-		p.Log.Debug(
-			"dropping %s message to %s%s due to a closed connection",
-			msg.Op(),
-			constants.NodeIDPrefix, p.id,
-		)
-		p.OutboundMsgThrottler.Release(msg, p.id)
-		p.Metrics.SendFailed(msg)
-		return false
-	}
-
-	p.sendQueue = append(p.sendQueue, msg)
-	p.sendQueueCond.Signal()
-	return true
 }
 
 func (p *peer) StartClose() {
 	p.startClosingOnce.Do(func() {
 		if err := p.conn.Close(); err != nil {
-			p.Log.Debug(
-				"closing connection to %s%s resulted in an error: %s",
-				constants.NodeIDPrefix, p.id,
-				err,
+			p.Log.Debug("failed to close connection",
+				zap.Stringer("nodeID", p.id),
+				zap.Error(err),
 			)
 		}
 
-		// The lock is grabbed here to avoid any potential race conditions
-		// causing the [Broadcast] to be dropped.
-		p.sendQueueCond.L.Lock()
-		p.closing = true
-		// Per [p.sendQueueCond]'s spec, it is signalled when [p.closing] is set
-		// to true so that we exit the WriteMessages goroutine.
-		p.sendQueueCond.Broadcast()
-		p.sendQueueCond.L.Unlock()
-
-		close(p.onClosing)
+		p.messageQueue.Close()
+		p.onClosingCtxCancel()
 	})
 }
 
@@ -364,57 +371,64 @@ func (p *peer) readMessages() {
 	for {
 		// Time out and close connection if we can't read the message length
 		if err := p.conn.SetReadDeadline(p.nextTimeout()); err != nil {
-			p.Log.Verbo(
-				"error setting the connection read timeout on %s%s: %s",
-				constants.NodeIDPrefix, p.id,
-				err,
+			p.Log.Verbo(failedToSetDeadlineLog,
+				zap.Stringer("nodeID", p.id),
+				zap.String("direction", "read"),
+				zap.Error(err),
 			)
 			return
 		}
 
 		// Read the message length
 		if _, err := io.ReadFull(reader, msgLenBytes); err != nil {
-			p.Log.Verbo(
-				"error reading from %s%s: %s",
-				constants.NodeIDPrefix, p.id,
-				err,
+			p.Log.Verbo("error reading message length",
+				zap.Stringer("nodeID", p.id),
+				zap.Error(err),
 			)
 			return
 		}
 
 		// Parse the message length
-		msgLen := binary.BigEndian.Uint32(msgLenBytes)
-
-		// Make sure the message length is valid.
-		if msgLen > constants.DefaultMaxMessageSize {
-			p.Log.Verbo(
-				"too large message length %d from %s%s",
-				msgLen,
-				constants.NodeIDPrefix, p.id,
+		msgLen, err := readMsgLen(msgLenBytes, constants.DefaultMaxMessageSize)
+		if err != nil {
+			p.Log.Verbo("error parsing message length",
+				zap.Stringer("nodeID", p.id),
+				zap.Error(err),
 			)
 			return
 		}
 
-		// TODO: allow cancelation here to avoid blocking when the connection is
-		//       shutting down.
 		// Wait until the throttler says we can proceed to read the message.
-		// Note that when we are done handling this message, or give up
-		// trying to read it, we must call [p.InboundMsgThrottler.Release]
-		// to give back the bytes used by this message.
-		p.InboundMsgThrottler.Acquire(uint64(msgLen), p.id)
-
+		//
 		// Invariant: When done processing this message, onFinishedHandling() is
 		// called exactly once. If this is not honored, the message throttler
 		// will leak until no new messages can be read. You can look at message
 		// throttler metrics to verify that there is no leak.
-		onFinishedHandling := func() { p.InboundMsgThrottler.Release(uint64(msgLen), p.id) }
+		//
+		// Invariant: There must only be one call to Acquire at any given time
+		// with the same nodeID. In this package, only this goroutine ever
+		// performs Acquire. Additionally, we ensure that this goroutine has
+		// exited before calling [Network.Disconnected] to guarantee that there
+		// can't be multiple instances of this goroutine running over different
+		// peer instances.
+		onFinishedHandling := p.InboundMsgThrottler.Acquire(
+			p.onClosingCtx,
+			uint64(msgLen),
+			p.id,
+		)
+
+		// If the peer is shutting down, there's no need to read the message.
+		if err := p.onClosingCtx.Err(); err != nil {
+			onFinishedHandling()
+			return
+		}
 
 		// Time out and close connection if we can't read message
 		if err := p.conn.SetReadDeadline(p.nextTimeout()); err != nil {
-			p.Log.Verbo(
-				"error setting the connection read timeout on %s%s: %s",
-				constants.NodeIDPrefix, p.id,
-				err,
+			p.Log.Verbo(failedToSetDeadlineLog,
+				zap.Stringer("nodeID", p.id),
+				zap.String("direction", "read"),
+				zap.Error(err),
 			)
 			onFinishedHandling()
 			return
@@ -423,173 +437,183 @@ func (p *peer) readMessages() {
 		// Read the message
 		msgBytes := make([]byte, msgLen)
 		if _, err := io.ReadFull(reader, msgBytes); err != nil {
-			p.Log.Verbo(
-				"error reading from %s%s: %s",
-				constants.NodeIDPrefix, p.id,
-				err,
+			p.Log.Verbo("error reading message",
+				zap.Stringer("nodeID", p.id),
+				zap.Error(err),
 			)
 			onFinishedHandling()
 			return
 		}
 
-		p.Log.Verbo(
-			"parsing message from %s%s:\n%s",
-			constants.NodeIDPrefix, p.id,
-			formatting.DumpBytes(msgBytes),
+		// Track the time it takes from now until the time the message is
+		// handled (in the event this message is handled at the network level)
+		// or the time the message is handed to the router (in the event this
+		// message is not handled at the network level.)
+		// [p.CPUTracker.StopProcessing] must be called when this loop iteration is
+		// finished.
+		p.ResourceTracker.StartProcessing(p.id, p.Clock.Time())
+
+		p.Log.Verbo("parsing message",
+			zap.Stringer("nodeID", p.id),
+			zap.Binary("messageBytes", msgBytes),
 		)
 
 		// Parse the message
 		msg, err := p.MessageCreator.Parse(msgBytes, p.id, onFinishedHandling)
 		if err != nil {
-			p.Log.Verbo(
-				"failed to parse message from %s%s: %s\n%s",
-				constants.NodeIDPrefix, p.id,
-				err,
-				formatting.DumpBytes(msgBytes),
+			p.Log.Verbo("failed to parse message",
+				zap.Stringer("nodeID", p.id),
+				zap.Binary("messageBytes", msgBytes),
+				zap.Error(err),
 			)
 
-			p.Metrics.FailedToParse.Inc()
+			p.Metrics.NumFailedToParse.Inc()
 
 			// Couldn't parse the message. Read the next one.
 			onFinishedHandling()
+			p.ResourceTracker.StopProcessing(p.id, p.Clock.Time())
 			continue
 		}
 
-		now := p.Clock.Time().Unix()
-		atomic.StoreInt64(&p.Config.LastReceived, now)
-		atomic.StoreInt64(&p.lastReceived, now)
+		now := p.Clock.Time()
+		p.storeLastReceived(now)
 		p.Metrics.Received(msg, msgLen)
 
 		// Handle the message. Note that when we are done handling this message,
 		// we must call [msg.OnFinishedHandling()].
 		p.handle(msg)
+		p.ResourceTracker.StopProcessing(p.id, p.Clock.Time())
 	}
 }
 
 func (p *peer) writeMessages() {
 	defer func() {
-		// Release the bytes of the unsent messages to the outbound message
-		// throttler
-		p.sendQueueCond.L.Lock()
-		p.canSend = false
-		for _, msg := range p.sendQueue {
-			p.OutboundMsgThrottler.Release(msg, p.id)
-			p.Metrics.SendFailed(msg)
-		}
-		p.sendQueue = nil
-		p.sendQueueCond.L.Unlock()
-
 		p.StartClose()
 		p.close()
 	}()
 
 	writer := bufio.NewWriterSize(p.conn, p.Config.WriteBufferSize)
-	for { // When this loop exits, p.sendQueueCond.L is unlocked
-		msg, ok := p.nextMessageWithoutBlocking()
-		if !ok {
-			// Make sure the peer was fully sent all prior messages before
-			// blocking.
-			if err := writer.Flush(); err != nil {
-				p.Log.Verbo(
-					"couldn't flush writer to %s%s: %s",
-					constants.NodeIDPrefix, p.id,
-					err,
-				)
-				return
-			}
-			msg, ok = p.nextMessageWithBlocking()
-			if !ok {
-				// This peer is closing
-				return
-			}
-		}
 
-		msgBytes := msg.Bytes()
-		p.Log.Verbo(
-			"sending message to %s%s:\n%s",
-			constants.NodeIDPrefix, p.id,
-			formatting.DumpBytes(msgBytes),
+	// Make sure that the Handshake is the first message sent
+	mySignedIP, err := p.IPSigner.GetSignedIP()
+	if err != nil {
+		p.Log.Error("failed to get signed IP",
+			zap.Stringer("nodeID", p.id),
+			zap.Error(err),
 		)
-
-		msgLen := uint32(len(msgBytes))
-		msgLenBytes := [wrappers.IntLen]byte{}
-		binary.BigEndian.PutUint32(msgLenBytes[:], msgLen)
-
-		if err := p.conn.SetWriteDeadline(p.nextTimeout()); err != nil {
-			p.Log.Verbo(
-				"error setting write deadline to %s%s due to: %s",
-				constants.NodeIDPrefix, p.id,
-				err,
-			)
-			p.OutboundMsgThrottler.Release(msg, p.id)
-			msg.DecRef()
-			return
-		}
-
-		// Write the message
-		var buf net.Buffers = [][]byte{msgLenBytes[:], msgBytes}
-		if _, err := io.CopyN(writer, &buf, int64(wrappers.IntLen+msgLen)); err != nil {
-			p.Log.Verbo(
-				"error writing to %s%s due to: %s",
-				constants.NodeIDPrefix, p.id,
-				err,
-			)
-			p.OutboundMsgThrottler.Release(msg, p.id)
-			msg.DecRef()
-			return
-		}
-
-		p.OutboundMsgThrottler.Release(msg, p.id)
-
-		now := p.Clock.Time().Unix()
-		atomic.StoreInt64(&p.Config.LastSent, now)
-		atomic.StoreInt64(&p.lastSent, now)
-		p.Metrics.Sent(msg)
+		return
 	}
-}
-
-// Returns the next message to send to this peer.
-// If there is no message to send or the peer is closing, returns false.
-func (p *peer) nextMessageWithoutBlocking() (message.OutboundMessage, bool) {
-	p.sendQueueCond.L.Lock()
-	defer p.sendQueueCond.L.Unlock()
-
-	if len(p.sendQueue) == 0 || p.closing {
-		// There isn't a message to send or the peer is closing.
-		return nil, false
+	if port := mySignedIP.AddrPort.Port(); port == 0 {
+		p.Log.Error("signed IP has invalid port",
+			zap.Stringer("nodeID", p.id),
+			zap.Uint16("port", port),
+		)
+		return
 	}
 
-	msg := p.sendQueue[0]
-	p.sendQueue[0] = nil
-	p.sendQueue = p.sendQueue[1:]
-	return msg, true
-}
+	myVersion := p.VersionCompatibility.Version()
+	knownPeersFilter, knownPeersSalt := p.Network.KnownPeers()
 
-// Blocks until there is a message to send to this peer, then returns it.
-// Returns false if the peer is closing.
-func (p *peer) nextMessageWithBlocking() (message.OutboundMessage, bool) {
-	p.sendQueueCond.L.Lock()
-	defer p.sendQueueCond.L.Unlock()
+	_, areWeAPrimaryNetworkValidator := p.Validators.GetValidator(constants.PrimaryNetworkID, p.MyNodeID)
+	msg, err := p.MessageCreator.Handshake(
+		p.NetworkID,
+		p.Clock.Unix(),
+		mySignedIP.AddrPort,
+		myVersion.Name,
+		uint32(myVersion.Major),
+		uint32(myVersion.Minor),
+		uint32(myVersion.Patch),
+		mySignedIP.Timestamp,
+		mySignedIP.TLSSignature,
+		mySignedIP.BLSSignatureBytes,
+		p.MySubnets.List(),
+		p.SupportedACPs,
+		p.ObjectedACPs,
+		knownPeersFilter,
+		knownPeersSalt,
+		areWeAPrimaryNetworkValidator,
+	)
+	if err != nil {
+		p.Log.Error(failedToCreateMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.Error(err),
+		)
+		return
+	}
+
+	p.writeMessage(writer, msg)
 
 	for {
-		if p.closing {
-			return nil, false
+		msg, ok := p.messageQueue.PopNow()
+		if ok {
+			p.writeMessage(writer, msg)
+			continue
 		}
-		if len(p.sendQueue) > 0 {
-			// There is a message to send
-			break
-		}
-		// Wait until there is a message to send
-		p.sendQueueCond.Wait()
-	}
 
-	msg := p.sendQueue[0]
-	p.sendQueue[0] = nil
-	p.sendQueue = p.sendQueue[1:]
-	return msg, true
+		// Make sure the peer was fully sent all prior messages before
+		// blocking.
+		if err := writer.Flush(); err != nil {
+			p.Log.Verbo("failed to flush writer",
+				zap.Stringer("nodeID", p.id),
+				zap.Error(err),
+			)
+			return
+		}
+
+		msg, ok = p.messageQueue.Pop()
+		if !ok {
+			// This peer is closing
+			return
+		}
+
+		p.writeMessage(writer, msg)
+	}
 }
 
-func (p *peer) sendPings() {
+func (p *peer) writeMessage(writer io.Writer, msg message.OutboundMessage) {
+	msgBytes := msg.Bytes()
+	p.Log.Verbo("sending message",
+		zap.Stringer("op", msg.Op()),
+		zap.Stringer("nodeID", p.id),
+		zap.Binary("messageBytes", msgBytes),
+	)
+
+	if err := p.conn.SetWriteDeadline(p.nextTimeout()); err != nil {
+		p.Log.Verbo(failedToSetDeadlineLog,
+			zap.Stringer("nodeID", p.id),
+			zap.String("direction", "write"),
+			zap.Error(err),
+		)
+		return
+	}
+
+	msgLen := uint32(len(msgBytes))
+	msgLenBytes, err := writeMsgLen(msgLen, constants.DefaultMaxMessageSize)
+	if err != nil {
+		p.Log.Verbo("error writing message length",
+			zap.Stringer("nodeID", p.id),
+			zap.Error(err),
+		)
+		return
+	}
+
+	// Write the message
+	var buf net.Buffers = [][]byte{msgLenBytes[:], msgBytes}
+	if _, err := io.CopyN(writer, &buf, int64(wrappers.IntLen+msgLen)); err != nil {
+		p.Log.Verbo("error writing message",
+			zap.Stringer("nodeID", p.id),
+			zap.Error(err),
+		)
+		return
+	}
+
+	now := p.Clock.Time()
+	p.storeLastSent(now)
+	p.Metrics.Sent(msg)
+}
+
+func (p *peer) sendNetworkMessages() {
 	sendPingsTicker := time.NewTicker(p.PingFrequency)
 	defer func() {
 		sendPingsTicker.Stop()
@@ -600,243 +624,579 @@ func (p *peer) sendPings() {
 
 	for {
 		select {
-		case <-sendPingsTicker.C:
-			if !p.Network.AllowConnection(p.id) {
-				p.Log.Debug(
-					"disconnecting from peer %s%s because the peer's connection is no longer desired",
-					constants.NodeIDPrefix, p.id,
+		case <-p.getPeerListChan:
+			knownPeersFilter, knownPeersSalt := p.Config.Network.KnownPeers()
+			_, areWeAPrimaryNetworkValidator := p.Validators.GetValidator(constants.PrimaryNetworkID, p.MyNodeID)
+			msg, err := p.Config.MessageCreator.GetPeerList(
+				knownPeersFilter,
+				knownPeersSalt,
+				areWeAPrimaryNetworkValidator,
+			)
+			if err != nil {
+				p.Log.Error(failedToCreateMessageLog,
+					zap.Stringer("nodeID", p.id),
+					zap.Stringer("messageOp", message.GetPeerListOp),
+					zap.Error(err),
 				)
 				return
 			}
 
-			if p.finishedHandshake.GetValue() {
-				if err := p.VersionCompatibility.Compatible(p.version); err != nil {
-					p.Log.Debug(
-						"disconnecting from peer %s%s version (%s) not compatible: %s",
-						constants.NodeIDPrefix, p.id,
-						p.version,
-						err,
-					)
-					return
-				}
+			p.Send(p.onClosingCtx, msg)
+		case <-sendPingsTicker.C:
+			if !p.Network.AllowConnection(p.id) {
+				p.Log.Debug(disconnectingLog,
+					zap.String("reason", "connection is no longer desired"),
+					zap.Stringer("nodeID", p.id),
+				)
+				return
 			}
 
-			msg, err := p.MessageCreator.Ping()
-			p.Log.AssertNoError(err)
-			p.Send(msg)
-		case <-p.onClosing:
+			// Only check if we should disconnect after the handshake is
+			// finished to avoid race conditions and accessing uninitialized
+			// values.
+			if p.finishedHandshake.Get() && p.shouldDisconnect() {
+				return
+			}
+
+			primaryUptime := p.getUptime()
+			pingMessage, err := p.MessageCreator.Ping(primaryUptime)
+			if err != nil {
+				p.Log.Error(failedToCreateMessageLog,
+					zap.Stringer("nodeID", p.id),
+					zap.Stringer("messageOp", message.PingOp),
+					zap.Error(err),
+				)
+				return
+			}
+
+			p.Send(p.onClosingCtx, pingMessage)
+		case <-p.onClosingCtx.Done():
 			return
 		}
 	}
 }
 
+// shouldDisconnect is called both during receipt of the Handshake message and
+// periodically when sending a Ping message (after finishing the handshake!).
+//
+// It is called during the Handshake to prevent marking a peer as connected and
+// then immediately disconnecting from them.
+//
+// It is called when sending a Ping message to account for validator set
+// changes. It's called when sending a Ping rather than in a validator set
+// callback to avoid signature verification on the P-chain accept path.
+func (p *peer) shouldDisconnect() bool {
+	if err := p.VersionCompatibility.Compatible(p.version); err != nil {
+		p.Log.Debug(disconnectingLog,
+			zap.String("reason", "version not compatible"),
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("peerVersion", p.version),
+			zap.Error(err),
+		)
+		return true
+	}
+
+	// Enforce that all validators that have registered a BLS key are signing
+	// their IP with it after the activation of Durango.
+	vdr, ok := p.Validators.GetValidator(constants.PrimaryNetworkID, p.id)
+	if !ok || vdr.PublicKey == nil || vdr.TxID == p.txIDOfVerifiedBLSKey {
+		return false
+	}
+
+	validSignature := bls.VerifyProofOfPossession(
+		vdr.PublicKey,
+		p.ip.BLSSignature,
+		p.ip.UnsignedIP.bytes(),
+	)
+	if !validSignature {
+		p.Log.Debug(disconnectingLog,
+			zap.String("reason", "invalid BLS signature"),
+			zap.Stringer("nodeID", p.id),
+		)
+		return true
+	}
+
+	// Avoid unnecessary signature verifications by only verifying the signature
+	// once per validation period.
+	p.txIDOfVerifiedBLSKey = vdr.TxID
+	return false
+}
+
 func (p *peer) handle(msg message.InboundMessage) {
-	op := msg.Op()
-	switch op { // Network-related message types
-	case message.Ping:
-		p.handlePing(msg)
+	switch m := msg.Message().(type) { // Network-related message types
+	case *p2p.Ping:
+		p.handlePing(m)
 		msg.OnFinishedHandling()
 		return
-	case message.Pong:
-		p.handlePong(msg)
+	case *p2p.Pong:
+		p.handlePong(m)
 		msg.OnFinishedHandling()
 		return
-	case message.Version:
-		p.handleVersion(msg)
+	case *p2p.Handshake:
+		p.handleHandshake(m)
 		msg.OnFinishedHandling()
 		return
-	case message.PeerList:
-		p.handlePeerList(msg)
+	case *p2p.GetPeerList:
+		p.handleGetPeerList(m)
+		msg.OnFinishedHandling()
+		return
+	case *p2p.PeerList:
+		p.handlePeerList(m)
 		msg.OnFinishedHandling()
 		return
 	}
-	if !p.finishedHandshake.GetValue() {
-		p.Log.Debug(
-			"dropping %s from %s%s because handshake isn't finished",
-			op,
-			constants.NodeIDPrefix, p.id,
+	if !p.finishedHandshake.Get() {
+		p.Log.Debug("dropping message",
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", msg.Op()),
+			zap.String("reason", "handshake isn't finished"),
 		)
 		msg.OnFinishedHandling()
 		return
 	}
 
 	// Consensus and app-level messages
-	p.Router.HandleInbound(msg)
+	p.Router.HandleInbound(context.Background(), msg)
 }
 
-func (p *peer) handlePing(_ message.InboundMessage) {
-	msg, err := p.Network.Pong(p.id)
-	p.Log.AssertNoError(err)
-	p.Send(msg)
-}
-
-func (p *peer) handlePong(msg message.InboundMessage) {
-	uptime := msg.Get(message.Uptime).(uint8)
-	if uptime > 100 {
-		return
-	}
-
-	p.observedUptimeLock.Lock()
-	p.observedUptime = uptime // [0, 100] percentage
-	p.observedUptimeLock.Unlock()
-}
-
-func (p *peer) handleVersion(msg message.InboundMessage) {
-	if p.gotVersion.GetValue() {
-		p.Log.Verbo(
-			"dropping duplicated version message from %s%s",
-			constants.NodeIDPrefix, p.id,
-		)
-		return
-	}
-
-	if peerNetworkID := msg.Get(message.NetworkID).(uint32); peerNetworkID != p.NetworkID {
-		p.Log.Debug(
-			"networkID of %s%s (%d) doesn't match our's (%d)",
-			constants.NodeIDPrefix, p.id,
-			peerNetworkID,
-			p.NetworkID,
+func (p *peer) handlePing(msg *p2p.Ping) {
+	if msg.Uptime > 100 {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.PingOp),
+			zap.Stringer("subnetID", constants.PrimaryNetworkID),
+			zap.Uint32("uptime", msg.Uptime),
 		)
 		p.StartClose()
 		return
 	}
+	p.observedUptime.Set(msg.Uptime)
 
-	myTime := float64(p.Clock.Unix())
-	peerTime := float64(msg.Get(message.MyTime).(uint64))
-	if math.Abs(peerTime-myTime) > p.MaxClockDifference.Seconds() {
-		if p.Beacons.Contains(p.id) {
-			p.Log.Warn(
-				"beacon %s%s reports time (%d) that is too far out of sync with our's (%d)",
-				constants.NodeIDPrefix, p.id,
-				uint64(peerTime),
-				uint64(myTime),
-			)
-		} else {
-			p.Log.Debug(
-				"peer %s%s reports time (%d) that is too far out of sync with our's (%d)",
-				constants.NodeIDPrefix, p.id,
-				uint64(peerTime),
-				uint64(myTime),
-			)
-		}
-		p.StartClose()
-		return
-	}
-
-	peerVersionStr := msg.Get(message.VersionStr).(string)
-	peerVersion, err := p.VersionParser.Parse(peerVersionStr)
+	pongMessage, err := p.MessageCreator.Pong()
 	if err != nil {
-		p.Log.Debug(
-			"version of %s%s could not be parsed: %s",
-			constants.NodeIDPrefix, p.id,
-			err,
+		p.Log.Error(failedToCreateMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.PongOp),
+			zap.Error(err),
 		)
 		p.StartClose()
 		return
 	}
-	p.version = peerVersion
 
-	if p.VersionCompatibility.Version().Before(peerVersion) {
-		if p.Beacons.Contains(p.id) {
-			p.Log.Info(
-				"beacon %s%s attempting to connect with newer version %s. You may want to update your client",
-				constants.NodeIDPrefix, p.id,
-				peerVersion,
-			)
-		} else {
-			p.Log.Debug(
-				"peer %s%s attempting to connect with newer version %s. You may want to update your client",
-				constants.NodeIDPrefix, p.id,
-				peerVersion,
-			)
+	p.Send(p.onClosingCtx, pongMessage)
+}
+
+func (p *peer) getUptime() uint32 {
+	primaryUptime, err := p.UptimeCalculator.CalculateUptimePercent(
+		p.id,
+	)
+	if err != nil {
+		p.Log.Debug(failedToGetUptimeLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("subnetID", constants.PrimaryNetworkID),
+			zap.Error(err),
+		)
+		primaryUptime = 0
+	}
+
+	primaryUptimePercent := uint32(primaryUptime * 100)
+	return primaryUptimePercent
+}
+
+func (*peer) handlePong(*p2p.Pong) {}
+
+func (p *peer) handleHandshake(msg *p2p.Handshake) {
+	if p.gotHandshake.Get() {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.String("reason", "already received handshake"),
+		)
+		p.StartClose()
+		return
+	}
+
+	if msg.NetworkId != p.NetworkID {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.String("field", "networkID"),
+			zap.Uint32("peerNetworkID", msg.NetworkId),
+			zap.Uint32("ourNetworkID", p.NetworkID),
+		)
+		p.StartClose()
+		return
+	}
+
+	localTime := p.Clock.Time()
+	localUnixTime := uint64(localTime.Unix())
+	clockDifference := math.Abs(float64(msg.MyTime) - float64(localUnixTime))
+
+	p.Metrics.ClockSkewCount.Inc()
+	p.Metrics.ClockSkewSum.Add(clockDifference)
+
+	if clockDifference > p.MaxClockDifference.Seconds() {
+		log := p.Log.Debug
+		if _, ok := p.Beacons.GetValidator(constants.PrimaryNetworkID, p.id); ok {
+			log = p.Log.Warn
 		}
-	}
-
-	if err := p.VersionCompatibility.Compatible(peerVersion); err != nil {
-		p.Log.Verbo("peer %s%s version (%s) not compatible: %s",
-			constants.NodeIDPrefix, p.id,
-			peerVersion,
-			err,
+		log(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.String("field", "myTime"),
+			zap.Uint64("peerTime", msg.MyTime),
+			zap.Uint64("localTime", localUnixTime),
 		)
 		p.StartClose()
 		return
 	}
 
-	// Note that it is expected that the [versionTime] can be in the past. We
-	// are just verifying that the claimed signing time isn't too far in the
-	// future here.
-	versionTime := msg.Get(message.VersionTime).(uint64)
-	if float64(versionTime)-myTime > p.MaxClockDifference.Seconds() {
-		p.Log.Debug(
-			"peer %s%s attempting to connect with version timestamp (%d) too far in the future",
-			constants.NodeIDPrefix, p.id,
-			versionTime,
-		)
-		p.StartClose()
-		return
+	p.version = &version.Application{
+		Name:  msg.Client.GetName(),
+		Major: int(msg.Client.GetMajor()),
+		Minor: int(msg.Client.GetMinor()),
+		Patch: int(msg.Client.GetPatch()),
 	}
 
-	peerIP := msg.Get(message.IP).(utils.IPDesc)
+	if p.VersionCompatibility.Version().Before(p.version) {
+		log := p.Log.Debug
+		if _, ok := p.Beacons.GetValidator(constants.PrimaryNetworkID, p.id); ok {
+			log = p.Log.Info
+		}
+		log("peer attempting to connect with newer version. You may want to update your client",
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("peerVersion", p.version),
+		)
+	}
 
 	// handle subnet IDs
-	subnetIDsBytes := msg.Get(message.TrackedSubnets).([][]byte)
-	for _, subnetIDBytes := range subnetIDsBytes {
+	if numTrackedSubnets := len(msg.TrackedSubnets); numTrackedSubnets > maxNumTrackedSubnets {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.String("field", "trackedSubnets"),
+			zap.Int("numTrackedSubnets", numTrackedSubnets),
+		)
+		p.StartClose()
+		return
+	}
+
+	p.trackedSubnets.Add(constants.PrimaryNetworkID)
+	for _, subnetIDBytes := range msg.TrackedSubnets {
 		subnetID, err := ids.ToID(subnetIDBytes)
 		if err != nil {
-			p.Log.Debug(
-				"tracked subnet of %s%s could not be parsed: %s",
-				constants.NodeIDPrefix, p.id,
-				err,
+			p.Log.Debug(malformedMessageLog,
+				zap.Stringer("nodeID", p.id),
+				zap.Stringer("messageOp", message.HandshakeOp),
+				zap.String("field", "trackedSubnets"),
+				zap.Error(err),
 			)
 			p.StartClose()
 			return
 		}
-		// add only if we also track this subnet
-		if p.MySubnets.Contains(subnetID) {
-			p.trackedSubnets.Add(subnetID)
+		p.trackedSubnets.Add(subnetID)
+	}
+
+	for _, acp := range msg.SupportedAcps {
+		if constants.CurrentACPs.Contains(acp) {
+			p.supportedACPs.Add(acp)
+		}
+	}
+	for _, acp := range msg.ObjectedAcps {
+		if constants.CurrentACPs.Contains(acp) {
+			p.objectedACPs.Add(acp)
 		}
 	}
 
-	p.ip = &SignedIP{
-		IP: UnsignedIP{
-			IP:        peerIP,
-			Timestamp: versionTime,
-		},
-		Signature: msg.Get(message.SigBytes).([]byte),
-	}
-	if err := p.ip.Verify(p.cert); err != nil {
-		p.Log.Debug("signature verification failed for %s%s: %s",
-			constants.NodeIDPrefix, p.id,
-			err,
+	if p.supportedACPs.Overlaps(p.objectedACPs) {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.String("field", "acps"),
+			zap.Reflect("supportedACPs", p.supportedACPs),
+			zap.Reflect("objectedACPs", p.objectedACPs),
 		)
 		p.StartClose()
 		return
 	}
 
-	p.gotVersion.SetValue(true)
+	var (
+		knownPeers = bloom.EmptyFilter
+		salt       []byte
+	)
+	if msg.KnownPeers != nil {
+		var err error
+		knownPeers, err = bloom.Parse(msg.KnownPeers.Filter)
+		if err != nil {
+			p.Log.Debug(malformedMessageLog,
+				zap.Stringer("nodeID", p.id),
+				zap.Stringer("messageOp", message.HandshakeOp),
+				zap.String("field", "knownPeers.filter"),
+				zap.Error(err),
+			)
+			p.StartClose()
+			return
+		}
 
-	peerlistMsg, err := p.Network.Peers()
-	p.Log.AssertNoError(err)
-	p.Send(peerlistMsg)
+		salt = msg.KnownPeers.Salt
+		if saltLen := len(salt); saltLen > maxBloomSaltLen {
+			p.Log.Debug(malformedMessageLog,
+				zap.Stringer("nodeID", p.id),
+				zap.Stringer("messageOp", message.HandshakeOp),
+				zap.String("field", "knownPeers.salt"),
+				zap.Int("saltLen", saltLen),
+			)
+			p.StartClose()
+			return
+		}
+	}
+
+	addr, ok := ips.AddrFromSlice(msg.IpAddr)
+	if !ok {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.String("field", "ip"),
+			zap.Int("ipLen", len(msg.IpAddr)),
+		)
+		p.StartClose()
+		return
+	}
+
+	port := uint16(msg.IpPort)
+	if msg.IpPort == 0 {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.String("field", "port"),
+			zap.Uint16("port", port),
+		)
+		p.StartClose()
+		return
+	}
+
+	p.ip = &SignedIP{
+		UnsignedIP: UnsignedIP{
+			AddrPort: netip.AddrPortFrom(
+				addr,
+				port,
+			),
+			Timestamp: msg.IpSigningTime,
+		},
+		TLSSignature: msg.IpNodeIdSig,
+	}
+	maxTimestamp := localTime.Add(p.MaxClockDifference)
+	if err := p.ip.Verify(p.cert, maxTimestamp); err != nil {
+		log := p.Log.Debug
+		if _, ok := p.Beacons.GetValidator(constants.PrimaryNetworkID, p.id); ok {
+			log = p.Log.Warn
+		}
+		log(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.String("field", "tlsSignature"),
+			zap.Uint64("peerTime", msg.MyTime),
+			zap.Uint64("localTime", localUnixTime),
+			zap.Error(err),
+		)
+
+		p.StartClose()
+		return
+	}
+
+	signature, err := bls.SignatureFromBytes(msg.IpBlsSig)
+	if err != nil {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.HandshakeOp),
+			zap.String("field", "blsSignature"),
+			zap.Error(err),
+		)
+		p.StartClose()
+		return
+	}
+
+	p.ip.BLSSignature = signature
+	p.ip.BLSSignatureBytes = msg.IpBlsSig
+
+	// If the peer is running an incompatible version or has an invalid BLS
+	// signature, disconnect from them prior to marking the handshake as
+	// completed.
+	if p.shouldDisconnect() {
+		p.StartClose()
+		return
+	}
+
+	p.gotHandshake.Set(true)
+
+	peerIPs := p.Network.Peers(p.id, p.trackedSubnets, msg.AllSubnets, knownPeers, salt)
+
+	// We bypass throttling here to ensure that the handshake message is
+	// acknowledged correctly.
+	peerListMsg, err := p.Config.MessageCreator.PeerList(peerIPs, true /*=bypassThrottling*/)
+	if err != nil {
+		p.Log.Error(failedToCreateMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.PeerListOp),
+			zap.Error(err),
+		)
+		p.StartClose()
+		return
+	}
+
+	if !p.Send(p.onClosingCtx, peerListMsg) {
+		// Because throttling was marked to be bypassed with this message,
+		// sending should only fail if the peer has started closing.
+		p.Log.Debug("failed to send reliable message",
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.PeerListOp),
+			zap.Error(p.onClosingCtx.Err()),
+		)
+		p.StartClose()
+	}
 }
 
-func (p *peer) handlePeerList(msg message.InboundMessage) {
-	if !p.finishedHandshake.GetValue() {
-		if !p.gotVersion.GetValue() {
+func (p *peer) handleGetPeerList(msg *p2p.GetPeerList) {
+	if !p.finishedHandshake.Get() {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.GetPeerListOp),
+			zap.String("reason", "not finished handshake"),
+		)
+		return
+	}
+
+	knownPeersMsg := msg.GetKnownPeers()
+	filter, err := bloom.Parse(knownPeersMsg.GetFilter())
+	if err != nil {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.GetPeerListOp),
+			zap.String("field", "knownPeers.filter"),
+			zap.Error(err),
+		)
+		p.StartClose()
+		return
+	}
+
+	salt := knownPeersMsg.GetSalt()
+	if saltLen := len(salt); saltLen > maxBloomSaltLen {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.GetPeerListOp),
+			zap.String("field", "knownPeers.salt"),
+			zap.Int("saltLen", saltLen),
+		)
+		p.StartClose()
+		return
+	}
+
+	peerIPs := p.Network.Peers(p.id, p.trackedSubnets, msg.AllSubnets, filter, salt)
+	if len(peerIPs) == 0 {
+		p.Log.Debug("skipping sending of empty peer list",
+			zap.Stringer("nodeID", p.id),
+		)
+		return
+	}
+
+	// Bypass throttling is disabled here to follow the non-handshake message
+	// sending pattern.
+	peerListMsg, err := p.Config.MessageCreator.PeerList(peerIPs, false /*=bypassThrottling*/)
+	if err != nil {
+		p.Log.Error(failedToCreateMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.PeerListOp),
+			zap.Error(err),
+		)
+		return
+	}
+
+	p.Send(p.onClosingCtx, peerListMsg)
+}
+
+func (p *peer) handlePeerList(msg *p2p.PeerList) {
+	if !p.finishedHandshake.Get() {
+		if !p.gotHandshake.Get() {
 			return
 		}
 
 		p.Network.Connected(p.id)
-		p.finishedHandshake.SetValue(true)
+		p.finishedHandshake.Set(true)
 		close(p.onFinishHandshake)
 	}
 
-	ips := msg.Get(message.Peers).([]utils.IPCertDesc)
-	for _, ip := range ips {
-		p.Network.Track(ip)
+	discoveredIPs := make([]*ips.ClaimedIPPort, len(msg.ClaimedIpPorts)) // the peers this peer told us about
+	for i, claimedIPPort := range msg.ClaimedIpPorts {
+		tlsCert, err := staking.ParseCertificate(claimedIPPort.X509Certificate)
+		if err != nil {
+			p.Log.Debug(malformedMessageLog,
+				zap.Stringer("nodeID", p.id),
+				zap.Stringer("messageOp", message.PeerListOp),
+				zap.String("field", "cert"),
+				zap.Error(err),
+			)
+			p.StartClose()
+			return
+		}
+
+		addr, ok := ips.AddrFromSlice(claimedIPPort.IpAddr)
+		if !ok {
+			p.Log.Debug(malformedMessageLog,
+				zap.Stringer("nodeID", p.id),
+				zap.Stringer("messageOp", message.PeerListOp),
+				zap.String("field", "ip"),
+				zap.Int("ipLen", len(claimedIPPort.IpAddr)),
+			)
+			p.StartClose()
+			return
+		}
+
+		port := uint16(claimedIPPort.IpPort)
+		if port == 0 {
+			p.Log.Debug(malformedMessageLog,
+				zap.Stringer("nodeID", p.id),
+				zap.Stringer("messageOp", message.PeerListOp),
+				zap.String("field", "port"),
+				zap.Uint16("port", port),
+			)
+			p.StartClose()
+			return
+		}
+
+		discoveredIPs[i] = ips.NewClaimedIPPort(
+			tlsCert,
+			netip.AddrPortFrom(
+				addr,
+				port,
+			),
+			claimedIPPort.Timestamp,
+			claimedIPPort.Signature,
+		)
+	}
+
+	if err := p.Network.Track(discoveredIPs); err != nil {
+		p.Log.Debug(malformedMessageLog,
+			zap.Stringer("nodeID", p.id),
+			zap.Stringer("messageOp", message.PeerListOp),
+			zap.String("field", "claimedIP"),
+			zap.Error(err),
+		)
+		p.StartClose()
 	}
 }
 
 func (p *peer) nextTimeout() time.Time {
 	return p.Clock.Time().Add(p.PongTimeout)
+}
+
+func (p *peer) storeLastSent(time time.Time) {
+	unixTime := time.Unix()
+	atomic.StoreInt64(&p.Config.LastSent, unixTime)
+	atomic.StoreInt64(&p.lastSent, unixTime)
+}
+
+func (p *peer) storeLastReceived(time time.Time) {
+	unixTime := time.Unix()
+	atomic.StoreInt64(&p.Config.LastReceived, unixTime)
+	atomic.StoreInt64(&p.lastReceived, unixTime)
 }

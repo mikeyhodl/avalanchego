@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package filesystem
@@ -7,33 +7,35 @@ import (
 	"os"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRenameIfExists(t *testing.T) {
+	require := require.New(t)
+
 	t.Parallel()
 
 	f, err := os.CreateTemp(os.TempDir(), "test-rename")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(err)
+
 	a := f.Name()
 	b := a + ".2"
-	f.Close()
+
+	require.NoError(f.Close())
 
 	// rename "a" to "b"
 	renamed, err := RenameIfExists(a, b)
-	assert.True(t, renamed)
-	assert.NoError(t, err)
+	require.NoError(err)
+	require.True(renamed)
 
 	// rename "b" to "a"
 	renamed, err = RenameIfExists(b, a)
-	assert.True(t, renamed)
-	assert.NoError(t, err)
+	require.NoError(err)
+	require.True(renamed)
 
 	// remove "a", but rename "a"->"b" should NOT error
-	assert.NoError(t, os.RemoveAll(a))
+	require.NoError(os.RemoveAll(a))
 	renamed, err = RenameIfExists(a, b)
-	assert.False(t, renamed)
-	assert.NoError(t, err)
+	require.NoError(err)
+	require.False(renamed)
 }

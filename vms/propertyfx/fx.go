@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package propertyfx
@@ -6,7 +6,6 @@ package propertyfx
 import (
 	"errors"
 
-	"github.com/ava-labs/avalanchego/utils/wrappers"
 	"github.com/ava-labs/avalanchego/vms/components/verify"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
 )
@@ -32,19 +31,17 @@ func (fx *Fx) Initialize(vmIntf interface{}) error {
 	log.Debug("initializing nft fx")
 
 	c := fx.VM.CodecRegistry()
-	errs := wrappers.Errs{}
-	errs.Add(
+	return errors.Join(
 		c.RegisterType(&MintOutput{}),
 		c.RegisterType(&OwnedOutput{}),
 		c.RegisterType(&MintOperation{}),
 		c.RegisterType(&BurnOperation{}),
 		c.RegisterType(&Credential{}),
 	)
-	return errs.Err
 }
 
 func (fx *Fx) VerifyOperation(txIntf, opIntf, credIntf interface{}, utxosIntf []interface{}) error {
-	tx, ok := txIntf.(secp256k1fx.Tx)
+	tx, ok := txIntf.(secp256k1fx.UnsignedTx)
 	switch {
 	case !ok:
 		return errWrongTxType
@@ -67,7 +64,7 @@ func (fx *Fx) VerifyOperation(txIntf, opIntf, credIntf interface{}, utxosIntf []
 	}
 }
 
-func (fx *Fx) VerifyMintOperation(tx secp256k1fx.Tx, op *MintOperation, cred *Credential, utxoIntf interface{}) error {
+func (fx *Fx) VerifyMintOperation(tx secp256k1fx.UnsignedTx, op *MintOperation, cred *Credential, utxoIntf interface{}) error {
 	out, ok := utxoIntf.(*MintOutput)
 	if !ok {
 		return errWrongUTXOType
@@ -85,7 +82,7 @@ func (fx *Fx) VerifyMintOperation(tx secp256k1fx.Tx, op *MintOperation, cred *Cr
 	}
 }
 
-func (fx *Fx) VerifyTransferOperation(tx secp256k1fx.Tx, op *BurnOperation, cred *Credential, utxoIntf interface{}) error {
+func (fx *Fx) VerifyTransferOperation(tx secp256k1fx.UnsignedTx, op *BurnOperation, cred *Credential, utxoIntf interface{}) error {
 	out, ok := utxoIntf.(*OwnedOutput)
 	if !ok {
 		return errWrongUTXOType
@@ -98,4 +95,6 @@ func (fx *Fx) VerifyTransferOperation(tx secp256k1fx.Tx, op *BurnOperation, cred
 	return fx.VerifyCredentials(tx, &op.Input, &cred.Credential, &out.OutputOwners)
 }
 
-func (fx *Fx) VerifyTransfer(_, _, _, _ interface{}) error { return errCantTransfer }
+func (*Fx) VerifyTransfer(_, _, _, _ interface{}) error {
+	return errCantTransfer
+}

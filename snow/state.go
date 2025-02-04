@@ -1,27 +1,41 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package snow
 
-import "errors"
+import (
+	"errors"
 
-type State uint8
-
-var ErrUnknownState = errors.New("unknown node state")
+	"github.com/ava-labs/avalanchego/proto/pb/p2p"
+)
 
 const (
-	Bootstrapping = iota + 1
+	Initializing State = iota
+	StateSyncing
+	Bootstrapping
 	NormalOp
 )
 
+var ErrUnknownState = errors.New("unknown state")
+
+type State uint8
+
 func (st State) String() string {
 	switch st {
+	case Initializing:
+		return "Initializing state"
+	case StateSyncing:
+		return "State syncing state"
 	case Bootstrapping:
 		return "Bootstrapping state"
 	case NormalOp:
 		return "Normal operations state"
 	default:
-		// State.Unknown treated as default
 		return "Unknown state"
 	}
+}
+
+type EngineState struct {
+	Type  p2p.EngineType
+	State State
 }

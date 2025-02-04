@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package nftfx
@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"errors"
 
-	"github.com/ava-labs/avalanchego/utils/wrappers"
 	"github.com/ava-labs/avalanchego/vms/components/verify"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
 )
@@ -34,19 +33,17 @@ func (fx *Fx) Initialize(vmIntf interface{}) error {
 	log.Debug("initializing nft fx")
 
 	c := fx.VM.CodecRegistry()
-	errs := wrappers.Errs{}
-	errs.Add(
+	return errors.Join(
 		c.RegisterType(&MintOutput{}),
 		c.RegisterType(&TransferOutput{}),
 		c.RegisterType(&MintOperation{}),
 		c.RegisterType(&TransferOperation{}),
 		c.RegisterType(&Credential{}),
 	)
-	return errs.Err
 }
 
 func (fx *Fx) VerifyOperation(txIntf, opIntf, credIntf interface{}, utxosIntf []interface{}) error {
-	tx, ok := txIntf.(secp256k1fx.Tx)
+	tx, ok := txIntf.(secp256k1fx.UnsignedTx)
 	switch {
 	case !ok:
 		return errWrongTxType
@@ -69,7 +66,7 @@ func (fx *Fx) VerifyOperation(txIntf, opIntf, credIntf interface{}, utxosIntf []
 	}
 }
 
-func (fx *Fx) VerifyMintOperation(tx secp256k1fx.Tx, op *MintOperation, cred *Credential, utxoIntf interface{}) error {
+func (fx *Fx) VerifyMintOperation(tx secp256k1fx.UnsignedTx, op *MintOperation, cred *Credential, utxoIntf interface{}) error {
 	out, ok := utxoIntf.(*MintOutput)
 	if !ok {
 		return errWrongUTXOType
@@ -87,7 +84,7 @@ func (fx *Fx) VerifyMintOperation(tx secp256k1fx.Tx, op *MintOperation, cred *Cr
 	}
 }
 
-func (fx *Fx) VerifyTransferOperation(tx secp256k1fx.Tx, op *TransferOperation, cred *Credential, utxoIntf interface{}) error {
+func (fx *Fx) VerifyTransferOperation(tx secp256k1fx.UnsignedTx, op *TransferOperation, cred *Credential, utxoIntf interface{}) error {
 	out, ok := utxoIntf.(*TransferOutput)
 	if !ok {
 		return errWrongUTXOType
@@ -107,4 +104,6 @@ func (fx *Fx) VerifyTransferOperation(tx secp256k1fx.Tx, op *TransferOperation, 
 	}
 }
 
-func (fx *Fx) VerifyTransfer(_, _, _, _ interface{}) error { return errCantTransfer }
+func (*Fx) VerifyTransfer(_, _, _, _ interface{}) error {
+	return errCantTransfer
+}

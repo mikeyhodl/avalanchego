@@ -1,21 +1,23 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package timeout
 
 import (
 	"fmt"
+	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/networking/benchlist"
 	"github.com/ava-labs/avalanchego/utils/timer"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
-var _ Manager = &manager{}
+var _ Manager = (*manager)(nil)
 
 // Manages timeouts for requests sent to peers.
 type Manager interface {
@@ -26,7 +28,7 @@ type Manager interface {
 	TimeoutDuration() time.Duration
 	// IsBenched returns true if messages to [nodeID] regarding [chainID]
 	// should not be sent over the network and should immediately fail.
-	IsBenched(nodeID ids.ShortID, chainID ids.ID) bool
+	IsBenched(nodeID ids.NodeID, chainID ids.ID) bool
 	// Register the existence of the given chain.
 	// Must be called before any method calls that use the
 	// ID of the chain.
@@ -35,12 +37,12 @@ type Manager interface {
 	// [nodeID] for chain [chainID]. If we don't receive a response in
 	// time, [timeoutHandler] is executed.
 	RegisterRequest(
-		nodeID ids.ShortID,
+		nodeID ids.NodeID,
 		chainID ids.ID,
-		op message.Op,
-		requestID ids.ID,
+		measureLatency bool,
+		requestID ids.RequestID,
 		timeoutHandler func(),
-	) (time.Time, bool)
+	)
 	// Registers that we would have sent a request to a validator but they
 	// are unreachable because they are benched or because of network conditions
 	// (e.g. we're not connected), so we didn't send the query. For the sake
@@ -52,33 +54,51 @@ type Manager interface {
 	// requestID we sent them. [latency] is the time between us
 	// sending them the request and receiving their response.
 	RegisterResponse(
-		nodeID ids.ShortID,
+		nodeID ids.NodeID,
 		chainID ids.ID,
-		requestID ids.ID,
+		requestID ids.RequestID,
 		op message.Op,
 		latency time.Duration,
 	)
 	// Mark that we no longer expect a response to this request we sent.
 	// Does not modify the timeout.
-	RemoveRequest(requestID ids.ID)
+	RemoveRequest(requestID ids.RequestID)
+
+	// Stops the manager.
+	Stop()
 }
 
 func NewManager(
 	timeoutConfig *timer.AdaptiveTimeoutConfig,
 	benchlistMgr benchlist.Manager,
-	metricsNamespace string,
-	metricsRegister prometheus.Registerer,
+	requestReg prometheus.Registerer,
+	responseReg prometheus.Registerer,
 ) (Manager, error) {
-	m := &manager{
-		benchlistMgr: benchlistMgr,
+	tm, err := timer.NewAdaptiveTimeoutManager(
+		timeoutConfig,
+		requestReg,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't create timeout manager: %w", err)
 	}
-	return m, m.tm.Initialize(timeoutConfig, metricsNamespace, metricsRegister)
+
+	m, err := newTimeoutMetrics(responseReg)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't create timeout metrics: %w", err)
+	}
+
+	return &manager{
+		tm:           tm,
+		benchlistMgr: benchlistMgr,
+		metrics:      m,
+	}, nil
 }
 
 type manager struct {
 	tm           timer.AdaptiveTimeoutManager
 	benchlistMgr benchlist.Manager
-	metrics      metrics
+	metrics      *timeoutMetrics
+	stopOnce     sync.Once
 }
 
 func (m *manager) Dispatch() {
@@ -89,7 +109,9 @@ func (m *manager) TimeoutDuration() time.Duration {
 	return m.tm.TimeoutDuration()
 }
 
-func (m *manager) IsBenched(nodeID ids.ShortID, chainID ids.ID) bool {
+// IsBenched returns true if messages to [nodeID] regarding [chainID]
+// should not be sent over the network and should immediately fail.
+func (m *manager) IsBenched(nodeID ids.NodeID, chainID ids.ID) bool {
 	return m.benchlistMgr.IsBenched(nodeID, chainID)
 }
 
@@ -103,37 +125,49 @@ func (m *manager) RegisterChain(ctx *snow.ConsensusContext) error {
 	return nil
 }
 
+// RegisterRequest notes that we expect a response of type [op] from
+// [nodeID] regarding chain [chainID]. If we don't receive a response in
+// time, [timeoutHandler]  is executed.
 func (m *manager) RegisterRequest(
-	nodeID ids.ShortID,
+	nodeID ids.NodeID,
 	chainID ids.ID,
-	op message.Op,
-	requestID ids.ID,
+	measureLatency bool,
+	requestID ids.RequestID,
 	timeoutHandler func(),
-) (time.Time, bool) {
+) {
 	newTimeoutHandler := func() {
-		// If this request timed out, tell the benchlist manager
-		m.benchlistMgr.RegisterFailure(chainID, nodeID)
+		if requestID.Op != byte(message.AppResponseOp) {
+			// If the request timed out and wasn't an AppRequest, tell the
+			// benchlist manager.
+			m.benchlistMgr.RegisterFailure(chainID, nodeID)
+		}
 		timeoutHandler()
 	}
-	return m.tm.Put(requestID, op, newTimeoutHandler), true
+	m.tm.Put(requestID, measureLatency, newTimeoutHandler)
 }
 
+// RegisterResponse registers that we received a response from [nodeID]
+// regarding the given request ID and chain.
 func (m *manager) RegisterResponse(
-	nodeID ids.ShortID,
+	nodeID ids.NodeID,
 	chainID ids.ID,
-	requestID ids.ID,
+	requestID ids.RequestID,
 	op message.Op,
 	latency time.Duration,
 ) {
-	m.metrics.Observe(nodeID, chainID, op, latency)
+	m.metrics.Observe(chainID, op, latency)
 	m.benchlistMgr.RegisterResponse(chainID, nodeID)
 	m.tm.Remove(requestID)
 }
 
-func (m *manager) RemoveRequest(requestID ids.ID) {
+func (m *manager) RemoveRequest(requestID ids.RequestID) {
 	m.tm.Remove(requestID)
 }
 
 func (m *manager) RegisterRequestToUnreachableValidator() {
 	m.tm.ObserveLatency(m.TimeoutDuration())
+}
+
+func (m *manager) Stop() {
+	m.stopOnce.Do(m.tm.Stop)
 }

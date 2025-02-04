@@ -1,46 +1,46 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package block
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/utils/units"
 )
 
-func equal(assert *assert.Assertions, chainID ids.ID, want, have SignedBlock) {
-	assert.Equal(want.ID(), have.ID())
-	assert.Equal(want.ParentID(), have.ParentID())
-	assert.Equal(want.PChainHeight(), have.PChainHeight())
-	assert.Equal(want.Timestamp(), have.Timestamp())
-	assert.Equal(want.Block(), have.Block())
-	assert.Equal(want.Proposer(), have.Proposer())
-	assert.Equal(want.Bytes(), have.Bytes())
-	assert.Equal(want.Verify(false, chainID), have.Verify(false, chainID))
-	assert.Equal(want.Verify(true, chainID), have.Verify(true, chainID))
+func equal(require *require.Assertions, want, have Block) {
+	require.Equal(want.ID(), have.ID())
+	require.Equal(want.ParentID(), have.ParentID())
+	require.Equal(want.Block(), have.Block())
+	require.Equal(want.Bytes(), have.Bytes())
+
+	signedWant, wantIsSigned := want.(SignedBlock)
+	signedHave, haveIsSigned := have.(SignedBlock)
+	require.Equal(wantIsSigned, haveIsSigned)
+	if !wantIsSigned {
+		return
+	}
+
+	require.Equal(signedWant.PChainHeight(), signedHave.PChainHeight())
+	require.Equal(signedWant.Timestamp(), signedHave.Timestamp())
+	require.Equal(signedWant.Proposer(), signedHave.Proposer())
 }
 
-func TestVerifyNoCertWithSignature(t *testing.T) {
+func TestBlockSizeLimit(t *testing.T) {
+	require := require.New(t)
+
 	parentID := ids.ID{1}
 	timestamp := time.Unix(123, 0)
 	pChainHeight := uint64(2)
-	innerBlockBytes := []byte{3}
+	innerBlockBytes := bytes.Repeat([]byte{0}, 270*units.KiB)
 
-	assert := assert.New(t)
-
-	builtBlockIntf, err := BuildUnsigned(parentID, timestamp, pChainHeight, innerBlockBytes)
-	assert.NoError(err)
-
-	builtBlock := builtBlockIntf.(*statelessBlock)
-	builtBlock.Signature = []byte{0}
-
-	err = builtBlock.Verify(false, ids.Empty)
-	assert.Error(err)
-
-	err = builtBlock.Verify(true, ids.Empty)
-	assert.Error(err)
+	// with the large limit, it should be able to build large blocks
+	_, err := BuildUnsigned(parentID, timestamp, pChainHeight, innerBlockBytes)
+	require.NoError(err)
 }

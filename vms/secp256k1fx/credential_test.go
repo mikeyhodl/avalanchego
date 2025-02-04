@@ -1,40 +1,35 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package secp256k1fx
 
 import (
-	"bytes"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/ava-labs/avalanchego/codec"
 	"github.com/ava-labs/avalanchego/codec/linearcodec"
-	"github.com/ava-labs/avalanchego/utils/crypto"
+	"github.com/ava-labs/avalanchego/utils/crypto/secp256k1"
 	"github.com/ava-labs/avalanchego/vms/components/verify"
 )
 
 func TestCredentialVerify(t *testing.T) {
 	cred := Credential{}
-	err := cred.Verify()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, cred.Verify())
 }
 
 func TestCredentialVerifyNil(t *testing.T) {
 	cred := (*Credential)(nil)
 	err := cred.Verify()
-	if err == nil {
-		t.Fatalf("Should have errored with a nil credential")
-	}
+	require.ErrorIs(t, err, ErrNilCredential)
 }
 
 func TestCredentialSerialize(t *testing.T) {
+	require := require.New(t)
 	c := linearcodec.NewDefault()
 	m := codec.NewDefaultManager()
-	if err := m.RegisterCodec(0, c); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(m.RegisterCodec(0, c))
 
 	expected := []byte{
 		// Codec version
@@ -62,7 +57,7 @@ func TestCredentialSerialize(t *testing.T) {
 		0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f,
 		0x00,
 	}
-	cred := Credential{Sigs: [][crypto.SECP256K1RSigLen]byte{
+	cred := Credential{Sigs: [][secp256k1.SignatureLen]byte{
 		{
 			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
 			0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
@@ -86,24 +81,15 @@ func TestCredentialSerialize(t *testing.T) {
 			0x00,
 		},
 	}}
-	err := cred.Verify()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(cred.Verify())
 
 	result, err := m.Marshal(0, &cred)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !bytes.Equal(expected, result) {
-		t.Fatalf("\nExpected: 0x%x\nResult:   0x%x", expected, result)
-	}
+	require.NoError(err)
+	require.Equal(expected, result)
 }
 
 func TestCredentialNotState(t *testing.T) {
 	intf := interface{}(&Credential{})
-	if _, ok := intf.(verify.State); ok {
-		t.Fatalf("shouldn't be marked as state")
-	}
+	_, ok := intf.(verify.State)
+	require.False(t, ok)
 }

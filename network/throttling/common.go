@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package throttling
@@ -22,8 +22,7 @@ type MsgByteThrottlerConfig struct {
 type commonMsgThrottler struct {
 	log  logging.Logger
 	lock sync.Mutex
-	// Primary network validator set
-	vdrs validators.Set
+	vdrs validators.Manager
 	// Max number of bytes that can be taken from the
 	// at-large byte allocation by a given node.
 	nodeMaxAtLargeBytes uint64
@@ -33,9 +32,9 @@ type commonMsgThrottler struct {
 	// Number of bytes left in the at-large byte allocation
 	remainingAtLargeBytes uint64
 	// Node ID --> Bytes they've taken from the validator allocation
-	nodeToVdrBytesUsed map[ids.ShortID]uint64
+	nodeToVdrBytesUsed map[ids.NodeID]uint64
 	// Node ID --> Bytes they've taken from the at-large allocation
-	nodeToAtLargeBytesUsed map[ids.ShortID]uint64
+	nodeToAtLargeBytesUsed map[ids.NodeID]uint64
 	// Max number of unprocessed bytes from validators
 	maxVdrBytes uint64
 }

@@ -1,43 +1,33 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package bootstrap
 
 import (
-	"github.com/prometheus/client_golang/prometheus"
+	"errors"
 
-	"github.com/ava-labs/avalanchego/utils/wrappers"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type metrics struct {
-	numFetched, numDropped, numAccepted prometheus.Counter
+	numFetched, numAccepted prometheus.Counter
 }
 
-func (m *metrics) Initialize(
-	namespace string,
-	registerer prometheus.Registerer,
-) error {
-	m.numFetched = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: namespace,
-		Name:      "fetched",
-		Help:      "Number of blocks fetched during bootstrapping",
-	})
-	m.numDropped = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: namespace,
-		Name:      "dropped",
-		Help:      "Number of blocks dropped during bootstrapping",
-	})
-	m.numAccepted = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: namespace,
-		Name:      "accepted",
-		Help:      "Number of blocks accepted during bootstrapping",
-	})
+func newMetrics(registerer prometheus.Registerer) (*metrics, error) {
+	m := &metrics{
+		numFetched: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "bs_fetched",
+			Help: "Number of blocks fetched during bootstrapping",
+		}),
+		numAccepted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "bs_accepted",
+			Help: "Number of blocks accepted during bootstrapping",
+		}),
+	}
 
-	errs := wrappers.Errs{}
-	errs.Add(
+	err := errors.Join(
 		registerer.Register(m.numFetched),
-		registerer.Register(m.numDropped),
 		registerer.Register(m.numAccepted),
 	)
-	return errs.Err
+	return m, err
 }

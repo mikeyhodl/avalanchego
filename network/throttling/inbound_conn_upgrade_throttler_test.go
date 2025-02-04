@@ -1,27 +1,29 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package throttling
 
 import (
-	"net"
+	"net/netip"
 	"testing"
 	"time"
 
-	"github.com/ava-labs/avalanchego/utils"
+	"github.com/stretchr/testify/require"
+
 	"github.com/ava-labs/avalanchego/utils/logging"
-	"github.com/stretchr/testify/assert"
 )
 
 var (
-	host1      = utils.IPDesc{IP: net.IPv4(1, 2, 3, 4), Port: 9651}
-	host2      = utils.IPDesc{IP: net.IPv4(1, 2, 3, 5), Port: 9653}
-	host3      = utils.IPDesc{IP: net.IPv4(1, 2, 3, 6), Port: 9655}
-	host4      = utils.IPDesc{IP: net.IPv4(1, 2, 3, 7), Port: 9657}
-	loopbackIP = utils.IPDesc{IP: net.IPv4(127, 0, 0, 1), Port: 9657}
+	host1      = netip.AddrPortFrom(netip.AddrFrom4([4]byte{1, 2, 3, 4}), 9651)
+	host2      = netip.AddrPortFrom(netip.AddrFrom4([4]byte{1, 2, 3, 5}), 9653)
+	host3      = netip.AddrPortFrom(netip.AddrFrom4([4]byte{1, 2, 3, 6}), 9655)
+	host4      = netip.AddrPortFrom(netip.AddrFrom4([4]byte{1, 2, 3, 7}), 9657)
+	loopbackIP = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 9657)
 )
 
 func TestNoInboundConnUpgradeThrottler(t *testing.T) {
+	require := require.New(t)
+
 	{
 		throttler := NewInboundConnUpgradeThrottler(
 			logging.NoLog{},
@@ -32,8 +34,7 @@ func TestNoInboundConnUpgradeThrottler(t *testing.T) {
 		)
 		// throttler should allow all
 		for i := 0; i < 10; i++ {
-			allow := throttler.ShouldUpgrade(host1)
-			assert.True(t, allow)
+			require.True(throttler.ShouldUpgrade(host1))
 		}
 	}
 	{
@@ -46,14 +47,13 @@ func TestNoInboundConnUpgradeThrottler(t *testing.T) {
 		)
 		// throttler should allow all
 		for i := 0; i < 10; i++ {
-			allow := throttler.ShouldUpgrade(host1)
-			assert.True(t, allow)
+			require.True(throttler.ShouldUpgrade(host1))
 		}
 	}
 }
 
 func TestInboundConnUpgradeThrottler(t *testing.T) {
-	assert := assert.New(t)
+	require := require.New(t)
 
 	cooldown := 5 * time.Second
 	throttlerIntf := NewInboundConnUpgradeThrottler(
@@ -66,31 +66,31 @@ func TestInboundConnUpgradeThrottler(t *testing.T) {
 
 	// Allow should always return true
 	// when called with a given IP for the first time
-	assert.True(throttlerIntf.ShouldUpgrade(host1))
-	assert.True(throttlerIntf.ShouldUpgrade(host2))
-	assert.True(throttlerIntf.ShouldUpgrade(host3))
+	require.True(throttlerIntf.ShouldUpgrade(host1))
+	require.True(throttlerIntf.ShouldUpgrade(host2))
+	require.True(throttlerIntf.ShouldUpgrade(host3))
 
 	// Shouldn't allow this IP because the number of connections
 	// within the last [cooldown] is at [MaxRecentConns]
-	assert.False(throttlerIntf.ShouldUpgrade(host4))
+	require.False(throttlerIntf.ShouldUpgrade(host4))
 
 	// Shouldn't allow these IPs again until [cooldown] has passed
-	assert.False(throttlerIntf.ShouldUpgrade(host1))
-	assert.False(throttlerIntf.ShouldUpgrade(host2))
-	assert.False(throttlerIntf.ShouldUpgrade(host3))
+	require.False(throttlerIntf.ShouldUpgrade(host1))
+	require.False(throttlerIntf.ShouldUpgrade(host2))
+	require.False(throttlerIntf.ShouldUpgrade(host3))
 
 	// Local host should never be rate-limited
-	assert.True(throttlerIntf.ShouldUpgrade(loopbackIP))
-	assert.True(throttlerIntf.ShouldUpgrade(loopbackIP))
-	assert.True(throttlerIntf.ShouldUpgrade(loopbackIP))
-	assert.True(throttlerIntf.ShouldUpgrade(loopbackIP))
-	assert.True(throttlerIntf.ShouldUpgrade(loopbackIP))
+	require.True(throttlerIntf.ShouldUpgrade(loopbackIP))
+	require.True(throttlerIntf.ShouldUpgrade(loopbackIP))
+	require.True(throttlerIntf.ShouldUpgrade(loopbackIP))
+	require.True(throttlerIntf.ShouldUpgrade(loopbackIP))
+	require.True(throttlerIntf.ShouldUpgrade(loopbackIP))
 
 	// Make sure [throttler.done] isn't closed
 	throttler := throttlerIntf.(*inboundConnUpgradeThrottler)
 	select {
 	case <-throttler.done:
-		t.Fatal("shouldn't be done")
+		require.FailNow("shouldn't be done")
 	default:
 	}
 
@@ -99,8 +99,8 @@ func TestInboundConnUpgradeThrottler(t *testing.T) {
 	// Make sure [throttler.done] is closed
 	select {
 	case _, chanOpen := <-throttler.done:
-		assert.False(chanOpen)
+		require.False(chanOpen)
 	default:
-		t.Fatal("should be done")
+		require.FailNow("should be done")
 	}
 }

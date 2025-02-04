@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package vertex
@@ -6,18 +6,21 @@ package vertex
 import (
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/ava-labs/avalanchego/codec"
 	"github.com/ava-labs/avalanchego/ids"
 )
 
 func TestParseInvalid(t *testing.T) {
-	vtxBytes := []byte{}
+	vtxBytes := []byte{1, 2, 3, 4, 5}
 	_, err := Parse(vtxBytes)
-	assert.Error(t, err, "parse on an invalid vertex should have errored")
+	require.ErrorIs(t, err, codec.ErrUnknownVersion)
 }
 
 func TestParseValid(t *testing.T) {
+	require := require.New(t)
+
 	chainID := ids.ID{1}
 	height := uint64(2)
 	parentIDs := []ids.ID{{4}, {5}}
@@ -28,10 +31,10 @@ func TestParseValid(t *testing.T) {
 		parentIDs,
 		txs,
 	)
-	assert.NoError(t, err)
+	require.NoError(err)
 
 	vtxBytes := vtx.Bytes()
 	parsedVtx, err := Parse(vtxBytes)
-	assert.NoError(t, err)
-	assert.Equal(t, vtx, parsedVtx)
+	require.NoError(err)
+	require.Equal(vtx, parsedVtx)
 }

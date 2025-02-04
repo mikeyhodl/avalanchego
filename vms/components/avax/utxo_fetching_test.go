@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package avax
@@ -6,25 +6,23 @@ package avax
 import (
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/ava-labs/avalanchego/codec"
 	"github.com/ava-labs/avalanchego/codec/linearcodec"
 	"github.com/ava-labs/avalanchego/database/memdb"
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/utils/wrappers"
+	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
 )
 
 func TestFetchUTXOs(t *testing.T) {
-	assert := assert.New(t)
+	require := require.New(t)
 
 	txID := ids.GenerateTestID()
 	assetID := ids.GenerateTestID()
 	addr := ids.GenerateTestShortID()
-	addrs := ids.ShortSet{}
-	addrs.Add(addr)
-	utxoID := ids.GenerateTestID()
+	addrs := set.Of(addr)
 	utxo := &UTXO{
 		UTXOID: UTXOID{
 			TxID:        txID,
@@ -44,53 +42,45 @@ func TestFetchUTXOs(t *testing.T) {
 	c := linearcodec.NewDefault()
 	manager := codec.NewDefaultManager()
 
-	errs := wrappers.Errs{}
-	errs.Add(
-		c.RegisterType(&secp256k1fx.TransferOutput{}),
-		manager.RegisterCodec(codecVersion, c),
-	)
-	assert.NoError(errs.Err)
+	require.NoError(c.RegisterType(&secp256k1fx.TransferOutput{}))
+	require.NoError(manager.RegisterCodec(codecVersion, c))
 
 	db := memdb.New()
-	s := NewUTXOState(db, manager)
+	s, err := NewUTXOState(db, manager, trackChecksum)
+	require.NoError(err)
 
-	err := s.PutUTXO(utxoID, utxo)
-	assert.NoError(err)
+	require.NoError(s.PutUTXO(utxo))
 
 	utxos, err := GetAllUTXOs(s, addrs)
-	assert.NoError(err)
-	assert.Len(utxos, 1)
-	assert.Equal(utxo, utxos[0])
+	require.NoError(err)
+	require.Len(utxos, 1)
+	require.Equal(utxo, utxos[0])
 
 	balance, err := GetBalance(s, addrs)
-	assert.NoError(err)
-	assert.EqualValues(12345, balance)
+	require.NoError(err)
+	require.Equal(uint64(12345), balance)
 }
 
 // TestGetPaginatedUTXOs tests
 // - Pagination when the total UTXOs exceed maxUTXOsToFetch (512)
 // - Fetching all UTXOs when they exceed maxUTXOsToFetch (512)
 func TestGetPaginatedUTXOs(t *testing.T) {
-	assert := assert.New(t)
+	require := require.New(t)
 
 	addr0 := ids.GenerateTestShortID()
 	addr1 := ids.GenerateTestShortID()
 	addr2 := ids.GenerateTestShortID()
-	addrs := ids.ShortSet{}
-	addrs.Add(addr0, addr1)
+	addrs := set.Of(addr0, addr1)
 
 	c := linearcodec.NewDefault()
 	manager := codec.NewDefaultManager()
 
-	errs := wrappers.Errs{}
-	errs.Add(
-		c.RegisterType(&secp256k1fx.TransferOutput{}),
-		manager.RegisterCodec(codecVersion, c),
-	)
-	assert.NoError(errs.Err)
+	require.NoError(c.RegisterType(&secp256k1fx.TransferOutput{}))
+	require.NoError(manager.RegisterCodec(codecVersion, c))
 
 	db := memdb.New()
-	s := NewUTXOState(db, manager)
+	s, err := NewUTXOState(db, manager, trackChecksum)
+	require.NoError(err)
 
 	// Create 1000 UTXOs each on addr0, addr1, and addr2.
 	for i := 0; i < 1000; i++ {
@@ -111,8 +101,7 @@ func TestGetPaginatedUTXOs(t *testing.T) {
 				},
 			},
 		}
-		err := s.PutUTXO(utxo0.InputID(), utxo0)
-		assert.NoError(err)
+		require.NoError(s.PutUTXO(utxo0))
 
 		utxo1 := &UTXO{
 			UTXOID: UTXOID{
@@ -129,8 +118,7 @@ func TestGetPaginatedUTXOs(t *testing.T) {
 				},
 			},
 		}
-		err = s.PutUTXO(utxo1.InputID(), utxo1)
-		assert.NoError(err)
+		require.NoError(s.PutUTXO(utxo1))
 
 		utxo2 := &UTXO{
 			UTXOID: UTXOID{
@@ -147,39 +135,26 @@ func TestGetPaginatedUTXOs(t *testing.T) {
 				},
 			},
 		}
-		err = s.PutUTXO(utxo2.InputID(), utxo2)
-		assert.NoError(err)
+		require.NoError(s.PutUTXO(utxo2))
 	}
 
 	var (
 		fetchedUTXOs []*UTXO
-		err          error
+		lastAddr     = ids.ShortEmpty
+		lastIdx      = ids.Empty
+		totalUTXOs   []*UTXO
 	)
-
-	lastAddr := ids.ShortEmpty
-	lastIdx := ids.Empty
-
-	var totalUTXOs []*UTXO
 	for i := 0; i <= 10; i++ {
 		fetchedUTXOs, lastAddr, lastIdx, err = GetPaginatedUTXOs(s, addrs, lastAddr, lastIdx, 512)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(err)
 
 		totalUTXOs = append(totalUTXOs, fetchedUTXOs...)
 	}
 
-	if len(totalUTXOs) != 2000 {
-		t.Fatalf("Wrong number of utxos. Should have paginated through all. Expected (%d) returned (%d)", 2000, len(totalUTXOs))
-	}
+	require.Len(totalUTXOs, 2000)
 
 	// Fetch all UTXOs
 	notPaginatedUTXOs, err := GetAllUTXOs(s, addrs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(notPaginatedUTXOs) != len(totalUTXOs) {
-		t.Fatalf("Wrong number of utxos. Expected (%d) returned (%d)", len(totalUTXOs), len(notPaginatedUTXOs))
-	}
+	require.NoError(err)
+	require.Len(notPaginatedUTXOs, len(totalUTXOs))
 }

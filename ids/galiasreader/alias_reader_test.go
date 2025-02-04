@@ -1,56 +1,44 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package galiasreader
 
 import (
-	"net"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-
-	"golang.org/x/net/context"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/test/bufconn"
+	"github.com/stretchr/testify/require"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/ids/idstest"
+	"github.com/ava-labs/avalanchego/vms/rpcchainvm/grpcutils"
 
 	aliasreaderpb "github.com/ava-labs/avalanchego/proto/pb/aliasreader"
 )
 
-const (
-	bufSize = 1024 * 1024
-)
-
 func TestInterface(t *testing.T) {
-	assert := assert.New(t)
-	for _, test := range ids.AliasTests {
-		listener := bufconn.Listen(bufSize)
-		server := grpc.NewServer()
-		w := ids.NewAliaser()
-		aliasreaderpb.RegisterAliasReaderServer(server, NewServer(w))
-		go func() {
-			if err := server.Serve(listener); err != nil {
-				t.Logf("Server exited with error: %v", err)
-			}
-		}()
+	for _, test := range idstest.AliasTests {
+		t.Run(test.Name, func(t *testing.T) {
+			require := require.New(t)
 
-		dialer := grpc.WithContextDialer(
-			func(context.Context, string) (net.Conn, error) {
-				return listener.Dial()
-			},
-		)
+			listener, err := grpcutils.NewListener()
+			require.NoError(err)
+			defer listener.Close()
+			serverCloser := grpcutils.ServerCloser{}
+			defer serverCloser.Stop()
+			w := ids.NewAliaser()
 
-		ctx := context.Background()
-		conn, err := grpc.DialContext(ctx, "", dialer, grpc.WithInsecure())
-		assert.NoError(err)
+			server := grpcutils.NewServer()
+			aliasreaderpb.RegisterAliasReaderServer(server, NewServer(w))
+			serverCloser.Add(server)
 
-		r := NewClient(aliasreaderpb.NewAliasReaderClient(conn))
-		test(assert, r, w)
+			go grpcutils.Serve(listener, server)
 
-		server.Stop()
-		_ = conn.Close()
-		_ = listener.Close()
+			conn, err := grpcutils.Dial(listener.Addr().String())
+			require.NoError(err)
+			defer conn.Close()
+
+			r := NewClient(aliasreaderpb.NewAliasReaderClient(conn))
+			test.Test(t, r, w)
+		})
 	}
 }

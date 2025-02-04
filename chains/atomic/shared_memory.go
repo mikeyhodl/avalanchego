@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package atomic
@@ -7,9 +7,10 @@ import (
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/database/versiondb"
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/utils"
 )
 
-var _ SharedMemory = &sharedMemory{}
+var _ SharedMemory = (*sharedMemory)(nil)
 
 type Requests struct {
 	RemoveRequests [][]byte   `serialize:"true"`
@@ -25,8 +26,14 @@ type Element struct {
 }
 
 type SharedMemory interface {
-	// Fetches from this chain's side
+	// Get fetches the values corresponding to [keys] that have been sent from
+	// [peerChainID]
+	//
+	// Invariant: Get guarantees that the resulting values array is the same
+	//            length as keys.
 	Get(peerChainID ids.ID, keys [][]byte) (values [][]byte, err error)
+	// Indexed returns a paginated result of values that possess any of the
+	// given traits and were sent from [peerChainID].
 	Indexed(
 		peerChainID ids.ID,
 		traits [][]byte,
@@ -39,6 +46,12 @@ type SharedMemory interface {
 		lastKey []byte,
 		err error,
 	)
+	// Apply performs the requested set of operations by atomically applying
+	// [requests] to their respective chainID keys in the map along with the
+	// batches on the underlying DB.
+	//
+	// Invariant: The underlying database of [batches] must be the same as the
+	//            underlying database for SharedMemory.
 	Apply(requests map[ids.ID]*Requests, batches ...database.Batch) error
 }
 
@@ -50,12 +63,11 @@ type sharedMemory struct {
 }
 
 func (sm *sharedMemory) Get(peerChainID ids.ID, keys [][]byte) ([][]byte, error) {
-	sharedID := sm.m.sharedID(peerChainID, sm.thisChainID)
+	sharedID := sharedID(peerChainID, sm.thisChainID)
 	db := sm.m.GetSharedDatabase(sm.m.db, sharedID)
 	defer sm.m.ReleaseSharedDatabase(sharedID)
 
 	s := state{
-		c:       sm.m.codec,
 		valueDB: inbound.getValueDB(sm.thisChainID, peerChainID, db),
 	}
 
@@ -77,13 +89,11 @@ func (sm *sharedMemory) Indexed(
 	startKey []byte,
 	limit int,
 ) ([][]byte, []byte, []byte, error) {
-	sharedID := sm.m.sharedID(peerChainID, sm.thisChainID)
+	sharedID := sharedID(peerChainID, sm.thisChainID)
 	db := sm.m.GetSharedDatabase(sm.m.db, sharedID)
 	defer sm.m.ReleaseSharedDatabase(sharedID)
 
-	s := state{
-		c: sm.m.codec,
-	}
+	s := state{}
 	s.valueDB, s.indexDB = inbound.getValueAndIndexDB(sm.thisChainID, peerChainID, db)
 
 	keys, lastTrait, lastKey, err := s.getKeys(traits, startTrait, startKey, limit)
@@ -108,13 +118,13 @@ func (sm *sharedMemory) Apply(requests map[ids.ID]*Requests, batches ...database
 	sharedIDs := make([]ids.ID, 0, len(requests))
 	sharedOperations := make(map[ids.ID]*Requests, len(requests))
 	for peerChainID, request := range requests {
-		sharedID := sm.m.sharedID(sm.thisChainID, peerChainID)
+		sharedID := sharedID(sm.thisChainID, peerChainID)
 		sharedIDs = append(sharedIDs, sharedID)
 
 		request.peerChainID = peerChainID
 		sharedOperations[sharedID] = request
 	}
-	ids.SortIDs(sharedIDs)
+	utils.Sort(sharedIDs)
 
 	// Make sure all operations are committed atomically
 	vdb := versiondb.New(sm.m.db)
@@ -125,10 +135,9 @@ func (sm *sharedMemory) Apply(requests map[ids.ID]*Requests, batches ...database
 		db := sm.m.GetSharedDatabase(vdb, sharedID)
 		defer sm.m.ReleaseSharedDatabase(sharedID)
 
-		s := state{
-			c: sm.m.codec,
-		}
+		s := state{}
 
+		// Perform any remove requests on the inbound database
 		s.valueDB, s.indexDB = inbound.getValueAndIndexDB(sm.thisChainID, req.peerChainID, db)
 		for _, removeRequest := range req.RemoveRequests {
 			if err := s.RemoveValue(removeRequest); err != nil {
@@ -136,6 +145,7 @@ func (sm *sharedMemory) Apply(requests map[ids.ID]*Requests, batches ...database
 			}
 		}
 
+		// Add Put requests to the outbound database.
 		s.valueDB, s.indexDB = outbound.getValueAndIndexDB(sm.thisChainID, req.peerChainID, db)
 		for _, putRequest := range req.PutRequests {
 			if err := s.SetValue(putRequest); err != nil {
@@ -144,6 +154,8 @@ func (sm *sharedMemory) Apply(requests map[ids.ID]*Requests, batches ...database
 		}
 	}
 
+	// Commit the operations on shared memory atomically with the contents of
+	// [batches].
 	batch, err := vdb.CommitBatch()
 	if err != nil {
 		return err

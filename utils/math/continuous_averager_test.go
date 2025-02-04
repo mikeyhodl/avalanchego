@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package math
@@ -6,36 +6,49 @@ package math
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestAverager(t *testing.T) {
+	require := require.New(t)
+
 	halflife := time.Second
 	currentTime := time.Now()
 
 	a := NewSyncAverager(NewAverager(0, halflife, currentTime))
-	if value := a.Read(); value != 0 {
-		t.Fatalf("wrong value returned. Expected %f ; Returned %f", 0.0, value)
-	}
+	require.Zero(a.Read())
 
 	currentTime = currentTime.Add(halflife)
 	a.Observe(1, currentTime)
-	if value := a.Read(); value != 1.0/1.5 {
-		t.Fatalf("wrong value returned. Expected %f ; Returned %f", 1.0/1.5, value)
-	}
+	require.Equal(1.0/1.5, a.Read())
 }
 
 func TestAveragerTimeTravel(t *testing.T) {
+	require := require.New(t)
+
 	halflife := time.Second
 	currentTime := time.Now()
 
 	a := NewSyncAverager(NewAverager(1, halflife, currentTime))
-	if value := a.Read(); value != 1 {
-		t.Fatalf("wrong value returned. Expected %f ; Returned %f", 1.0, value)
-	}
+	require.Equal(float64(1), a.Read())
 
 	currentTime = currentTime.Add(-halflife)
 	a.Observe(0, currentTime)
-	if value := a.Read(); value != 1.0/1.5 {
-		t.Fatalf("wrong value returned. Expected %f ; Returned %f", 1.0/1.5, value)
-	}
+	require.Equal(1.0/1.5, a.Read())
+}
+
+func TestUninitializedAverager(t *testing.T) {
+	require := require.New(t)
+
+	halfLife := time.Second
+	currentTime := time.Now()
+
+	firstObservation := float64(10)
+
+	a := NewUninitializedAverager(halfLife)
+	require.Zero(a.Read())
+
+	a.Observe(firstObservation, currentTime)
+	require.Equal(firstObservation, a.Read())
 }

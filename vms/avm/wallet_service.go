@@ -1,259 +1,119 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package avm
 
 import (
-	"container/list"
+	"errors"
 	"fmt"
 	"net/http"
 
+	"go.uber.org/zap"
+
 	"github.com/ava-labs/avalanchego/api"
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/vms/components/avax"
-	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
-
 	"github.com/ava-labs/avalanchego/utils/formatting"
-	safemath "github.com/ava-labs/avalanchego/utils/math"
+	"github.com/ava-labs/avalanchego/utils/linked"
+	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/vms/avm/txs"
+	"github.com/ava-labs/avalanchego/vms/txs/mempool"
 )
 
 type WalletService struct {
-	vm *VM
-
-	pendingTxMap      map[ids.ID]*list.Element
-	pendingTxOrdering *list.List
+	vm         *VM
+	pendingTxs *linked.Hashmap[ids.ID, *txs.Tx]
 }
 
 func (w *WalletService) decided(txID ids.ID) {
-	e, ok := w.pendingTxMap[txID]
-	if !ok {
+	if !w.pendingTxs.Delete(txID) {
 		return
 	}
-	delete(w.pendingTxMap, txID)
-	w.pendingTxOrdering.Remove(e)
+
+	w.vm.ctx.Log.Info("tx decided over wallet API",
+		zap.Stringer("txID", txID),
+	)
+	for {
+		txID, tx, ok := w.pendingTxs.Oldest()
+		if !ok {
+			return
+		}
+
+		err := w.vm.network.IssueTxFromRPCWithoutVerification(tx)
+		if err == nil {
+			w.vm.ctx.Log.Info("issued tx to mempool over wallet API",
+				zap.Stringer("txID", txID),
+			)
+			return
+		}
+		if errors.Is(err, mempool.ErrDuplicateTx) {
+			return
+		}
+
+		w.pendingTxs.Delete(txID)
+		w.vm.ctx.Log.Warn("dropping tx issued over wallet API",
+			zap.Stringer("txID", txID),
+			zap.Error(err),
+		)
+	}
 }
 
-func (w *WalletService) issue(txBytes []byte) (ids.ID, error) {
-	tx, err := w.vm.parsePrivateTx(txBytes)
-	if err != nil {
-		return ids.ID{}, err
-	}
+func (w *WalletService) issue(tx *txs.Tx) (ids.ID, error) {
+	txID := tx.ID()
+	w.vm.ctx.Log.Info("issuing tx over wallet API",
+		zap.Stringer("txID", txID),
+	)
 
-	txID, err := w.vm.IssueTx(txBytes)
-	if err != nil {
-		return ids.ID{}, err
-	}
-
-	if _, dup := w.pendingTxMap[txID]; dup {
+	if _, ok := w.pendingTxs.Get(txID); ok {
+		w.vm.ctx.Log.Warn("issuing duplicate tx over wallet API",
+			zap.Stringer("txID", txID),
+		)
 		return txID, nil
 	}
 
-	w.pendingTxMap[txID] = w.pendingTxOrdering.PushBack(tx)
+	if w.pendingTxs.Len() == 0 {
+		if err := w.vm.network.IssueTxFromRPCWithoutVerification(tx); err == nil {
+			w.vm.ctx.Log.Info("issued tx to mempool over wallet API",
+				zap.Stringer("txID", txID),
+			)
+		} else if !errors.Is(err, mempool.ErrDuplicateTx) {
+			w.vm.ctx.Log.Warn("failed to issue tx over wallet API",
+				zap.Stringer("txID", txID),
+				zap.Error(err),
+			)
+			return ids.Empty, err
+		}
+	} else {
+		w.vm.ctx.Log.Info("enqueueing tx over wallet API",
+			zap.Stringer("txID", txID),
+		)
+	}
+
+	w.pendingTxs.Put(txID, tx)
 	return txID, nil
 }
 
-func (w *WalletService) update(utxos []*avax.UTXO) ([]*avax.UTXO, error) {
-	utxoMap := make(map[ids.ID]*avax.UTXO, len(utxos))
-	for _, utxo := range utxos {
-		utxoMap[utxo.InputID()] = utxo
-	}
-
-	for e := w.pendingTxOrdering.Front(); e != nil; e = e.Next() {
-		tx := e.Value.(*Tx)
-		for _, inputUTXO := range tx.InputUTXOs() {
-			if inputUTXO.Symbolic() {
-				continue
-			}
-			utxoID := inputUTXO.InputID()
-			if _, exists := utxoMap[utxoID]; !exists {
-				return nil, errMissingUTXO
-			}
-			delete(utxoMap, utxoID)
-		}
-
-		for _, utxo := range tx.UTXOs() {
-			utxoMap[utxo.InputID()] = utxo
-		}
-	}
-
-	newUTXOs := make([]*avax.UTXO, len(utxoMap))
-	i := 0
-	for _, utxo := range utxoMap {
-		newUTXOs[i] = utxo
-		i++
-	}
-	return newUTXOs, nil
-}
-
 // IssueTx attempts to issue a transaction into consensus
-func (w *WalletService) IssueTx(r *http.Request, args *api.FormattedTx, reply *api.JSONTxID) error {
-	w.vm.ctx.Log.Debug("AVM Wallet: IssueTx called with %s", args.Tx)
+func (w *WalletService) IssueTx(_ *http.Request, args *api.FormattedTx, reply *api.JSONTxID) error {
+	w.vm.ctx.Log.Warn("deprecated API called",
+		zap.String("service", "wallet"),
+		zap.String("method", "issueTx"),
+		logging.UserString("tx", args.Tx),
+	)
 
 	txBytes, err := formatting.Decode(args.Encoding, args.Tx)
 	if err != nil {
 		return fmt.Errorf("problem decoding transaction: %w", err)
 	}
-	txID, err := w.issue(txBytes)
+
+	tx, err := w.vm.parser.ParseTx(txBytes)
+	if err != nil {
+		return err
+	}
+
+	w.vm.ctx.Lock.Lock()
+	defer w.vm.ctx.Lock.Unlock()
+
+	txID, err := w.issue(tx)
 	reply.TxID = txID
-	return err
-}
-
-// Send returns the ID of the newly created transaction
-func (w *WalletService) Send(r *http.Request, args *SendArgs, reply *api.JSONTxIDChangeAddr) error {
-	return w.SendMultiple(r, &SendMultipleArgs{
-		JSONSpendHeader: args.JSONSpendHeader,
-		Outputs:         []SendOutput{args.SendOutput},
-		Memo:            args.Memo,
-	}, reply)
-}
-
-// SendMultiple sends a transaction with multiple outputs.
-func (w *WalletService) SendMultiple(r *http.Request, args *SendMultipleArgs, reply *api.JSONTxIDChangeAddr) error {
-	w.vm.ctx.Log.Debug("AVM Wallet: SendMultiple called with username: %s", args.Username)
-
-	// Validate the memo field
-	memoBytes := []byte(args.Memo)
-	if l := len(memoBytes); l > avax.MaxMemoSize {
-		return fmt.Errorf("max memo length is %d but provided memo field is length %d",
-			avax.MaxMemoSize,
-			l)
-	} else if len(args.Outputs) == 0 {
-		return errNoOutputs
-	}
-
-	// Parse the from addresses
-	fromAddrs := ids.NewShortSet(len(args.From))
-	for _, addrStr := range args.From {
-		addr, err := w.vm.ParseLocalAddress(addrStr)
-		if err != nil {
-			return fmt.Errorf("couldn't parse 'From' address %s: %w", addrStr, err)
-		}
-		fromAddrs.Add(addr)
-	}
-
-	// Load user's UTXOs/keys
-	utxos, kc, err := w.vm.LoadUser(args.Username, args.Password, fromAddrs)
-	if err != nil {
-		return err
-	}
-
-	utxos, err = w.update(utxos)
-	if err != nil {
-		return err
-	}
-
-	// Parse the change address.
-	if len(kc.Keys) == 0 {
-		return errNoKeys
-	}
-	changeAddr, err := w.vm.selectChangeAddr(kc.Keys[0].PublicKey().Address(), args.ChangeAddr)
-	if err != nil {
-		return err
-	}
-
-	// Calculate required input amounts and create the desired outputs
-	// String repr. of asset ID --> asset ID
-	assetIDs := make(map[string]ids.ID)
-	// Asset ID --> amount of that asset being sent
-	amounts := make(map[ids.ID]uint64)
-	// Outputs of our tx
-	outs := []*avax.TransferableOutput{}
-	for _, output := range args.Outputs {
-		if output.Amount == 0 {
-			return errZeroAmount
-		}
-		assetID, ok := assetIDs[output.AssetID] // Asset ID of next output
-		if !ok {
-			assetID, err = w.vm.lookupAssetID(output.AssetID)
-			if err != nil {
-				return fmt.Errorf("couldn't find asset %s", output.AssetID)
-			}
-			assetIDs[output.AssetID] = assetID
-		}
-		currentAmount := amounts[assetID]
-		newAmount, err := safemath.Add64(currentAmount, uint64(output.Amount))
-		if err != nil {
-			return fmt.Errorf("problem calculating required spend amount: %w", err)
-		}
-		amounts[assetID] = newAmount
-
-		// Parse the to address
-		to, err := w.vm.ParseLocalAddress(output.To)
-		if err != nil {
-			return fmt.Errorf("problem parsing to address %q: %w", output.To, err)
-		}
-
-		// Create the Output
-		outs = append(outs, &avax.TransferableOutput{
-			Asset: avax.Asset{ID: assetID},
-			Out: &secp256k1fx.TransferOutput{
-				Amt: uint64(output.Amount),
-				OutputOwners: secp256k1fx.OutputOwners{
-					Locktime:  0,
-					Threshold: 1,
-					Addrs:     []ids.ShortID{to},
-				},
-			},
-		})
-	}
-
-	amountsWithFee := make(map[ids.ID]uint64, len(amounts)+1)
-	for assetKey, amount := range amounts {
-		amountsWithFee[assetKey] = amount
-	}
-
-	amountWithFee, err := safemath.Add64(amounts[w.vm.feeAssetID], w.vm.TxFee)
-	if err != nil {
-		return fmt.Errorf("problem calculating required spend amount: %w", err)
-	}
-	amountsWithFee[w.vm.feeAssetID] = amountWithFee
-
-	amountsSpent, ins, keys, err := w.vm.Spend(
-		utxos,
-		kc,
-		amountsWithFee,
-	)
-	if err != nil {
-		return err
-	}
-
-	// Add the required change outputs
-	for assetID, amountWithFee := range amountsWithFee {
-		amountSpent := amountsSpent[assetID]
-
-		if amountSpent > amountWithFee {
-			outs = append(outs, &avax.TransferableOutput{
-				Asset: avax.Asset{ID: assetID},
-				Out: &secp256k1fx.TransferOutput{
-					Amt: amountSpent - amountWithFee,
-					OutputOwners: secp256k1fx.OutputOwners{
-						Locktime:  0,
-						Threshold: 1,
-						Addrs:     []ids.ShortID{changeAddr},
-					},
-				},
-			})
-		}
-	}
-	avax.SortTransferableOutputs(outs, w.vm.codec)
-
-	tx := Tx{UnsignedTx: &BaseTx{BaseTx: avax.BaseTx{
-		NetworkID:    w.vm.ctx.NetworkID,
-		BlockchainID: w.vm.ctx.ChainID,
-		Outs:         outs,
-		Ins:          ins,
-		Memo:         memoBytes,
-	}}}
-	if err := tx.SignSECP256K1Fx(w.vm.codec, keys); err != nil {
-		return err
-	}
-
-	txID, err := w.issue(tx.Bytes())
-	if err != nil {
-		return fmt.Errorf("problem issuing transaction: %w", err)
-	}
-
-	reply.TxID = txID
-	reply.ChangeAddr, err = w.vm.FormatLocalAddress(changeAddr)
 	return err
 }

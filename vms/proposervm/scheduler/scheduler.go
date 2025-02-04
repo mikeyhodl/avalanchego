@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2021, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package scheduler
@@ -6,12 +6,17 @@ package scheduler
 import (
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/utils/logging"
 )
 
 type Scheduler interface {
 	Dispatch(startTime time.Time)
+
+	// Client must guarantee that [SetBuildBlockTime]
+	// is never called after [Close]
 	SetBuildBlockTime(t time.Time)
 	Close()
 }
@@ -77,7 +82,10 @@ waitloop:
 				default:
 					// If the channel to the engine is full, drop the message
 					// from the VM to avoid deadlock
-					s.log.Debug("dropping message %s from VM because channel to engine is full", msg)
+					s.log.Debug("dropping message from VM",
+						zap.String("reason", "channel to engine is full"),
+						zap.Stringer("messageString", msg),
+					)
 				}
 			case buildBlockTime, ok := <-s.newBuildBlockTime:
 				// The time at which we should notify the engine that it should
